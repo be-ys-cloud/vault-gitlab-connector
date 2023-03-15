@@ -1,0 +1,12 @@
+---
+- name: test
+  hosts: localhost
+  vars:
+    path: "gitlab/data/cloud/secret"
+    token: "{{ lookup('env', 'VAULT_TOKEN') }}"
+    url: "{{ lookup('env', 'VAULT_ADDR') }}"
+    secret: "secret={{ path }} token={{ token }} url={{ url }}"
+  tasks:
+    - name: Return all secrets from a path
+      debug:
+        msg: "{{ lookup('hashi_vault', secret) }}"

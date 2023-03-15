@@ -1,0 +1,22 @@
+image: docker.devtools.local/ci/docker
+
+stages:
+  - build
+
+build:
+  stage: build
+  script:
+    - apk add git curl
+    - git config --global http.sslVerify false
+    - ./patch.sh $CI_COMMIT_TAG
+    - docker build -t "beys_custom_build_vault:latest" .
+    - id=$(docker create beys_custom_build_vault:latest)
+    - docker cp $id:/builddir/bin/vault /bin/vault
+    - docker rm -f $id
+    - tar -cvf vault.bin.tar.gz /bin/vault
+    - curl -u $GITLAB_USER_LOGIN:$CI_JOB_TOKEN --upload-file vault.bin.tar.gz https://binaries.devtools.local/repository/binaries/vault-$CI_COMMIT_TAG-alm.bin.tar.gz --insecure
+  only:
+    - tags
+  when: manual
+  tags:
+    - docker

@@ -1,0 +1,15 @@
+stages:
+  - test
+
+test:
+    stage: test
+    variables:
+        VAULT_ADDR: 'http://172.17.0.1:8200'
+    script:
+        - apt update && apt install -y curl
+        - curl -v -X POST -k --data "{\"project\":$CI_PROJECT_ID,\"job\":$CI_JOB_ID,\"commit\":\"$CI_COMMIT_SHA\",\"token\":\"$CI_JOB_JWT\"}" "http://172.17.0.1:8200/v1/auth/gitlab/ci"
+        - export VAULT_TOKEN=$(curl -s -X POST -k --data "{\"project\":$CI_PROJECT_ID,\"job\":$CI_JOB_ID,\"commit\":\"$CI_COMMIT_SHA\",\"token\":\"$CI_JOB_JWT\"}" "http://172.17.0.1:8200/v1/auth/gitlab/ci" 2>&1 | grep -oP '(?<="client_token":")([^"]*)')
+        - echo $VAULT_TOKEN
+        - apt update && apt install -y python3-pip
+        - pip3 install ansible hvac
+        - ansible-playbook playbook.yml

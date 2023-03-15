@@ -1,0 +1,41 @@
+<div class="level-left">
+  <div class="control">
+    <a href="/v1/auth/gitlab/oauth"><span class="button auto-width is-primary">
+      OAuth2 Sign In
+    </span></a>
+  </div>
+</div>
+<div class="level-right">
+  <div class="field is-horizontal is-flex-end is-single-line">
+    <div class="control is-flex">
+      {{input
+        id="userPassToggle"
+        type="checkbox"
+        name="userPassToggle"
+        class="switch is-rounded is-success is-small"
+        checked=showUserPass
+        change=(toggle-action "showUserPass" this)
+        data-test-userpass-toggle=true
+      }}
+      <label for="userPassToggle">Username / Password</label>
+    </div>
+  </div>
+</div>
+{{#unless showUserPass}}
+<div class="field">
+  <label for="token" class="is-label">Gitlab Token</label>
+  <div class="control">
+    {{input
+      type="password"
+      value=token
+      name="token"
+      id="token"
+      class="input"
+      data-test-token=true
+      autocomplete="off"
+    }}
+  </div>
+</div>
+{{else}}
+{{partial "partials/userpass-form"}}
+{{/unless}}
