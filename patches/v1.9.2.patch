@@ -1,0 +1,3748 @@
+commit c7d34bf1a0bcca46a94a829f0209840ed276a40e
+Author: Florian <florian.forestier@be-ys.cloud>
+Date:   Sat Mar 18 19:32:38 2023 +0100
+
+    patches
+
+diff --git a/builtin/credential/gitlab/backend.go b/builtin/credential/gitlab/backend.go
+new file mode 100644
+index 0000000000..80a1607fe0
+--- /dev/null
++++ b/builtin/credential/gitlab/backend.go
+@@ -0,0 +1,240 @@
++package gitlab
++
++import (
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/rand"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"io"
++	mathrand "math/rand"
++	"net/http"
++	"net/url"
++	"strconv"
++	"time"
++
++	"strings"
++
++	cleanhttp "github.com/hashicorp/go-cleanhttp"
++	"github.com/hashicorp/vault/helper/mfa"
++	"github.com/hashicorp/vault/sdk/framework"
++	"github.com/hashicorp/vault/sdk/logical"
++	gitlab "github.com/xanzy/go-gitlab"
++)
++
++const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++
++// Factory of gitlab backend
++func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
++	b := Backend()
++	if err := b.Setup(ctx, conf); err != nil {
++		return nil, err
++	}
++	b.CipherKey = make([]byte, 16)
++	for i := range b.CipherKey {
++		b.CipherKey[i] = letterBytes[mathrand.Intn(len(letterBytes))]
++	}
++	return b, nil
++}
++
++// Backend constructor
++func Backend() *backend {
++	var b backend
++	b.GroupMap = &framework.PolicyMap{
++		PathMap: framework.PathMap{
++			Name: "groups",
++		},
++		DefaultKey: "default",
++	}
++
++	b.UserMap = &framework.PolicyMap{
++		PathMap: framework.PathMap{
++			Name: "users",
++		},
++		DefaultKey: "default",
++	}
++
++	allPaths := append(b.UserMap.Paths())
++	b.Backend = &framework.Backend{
++		Help: backendHelp,
++
++		PathsSpecial: &logical.Paths{
++			Root: mfa.MFARootPaths(),
++			Unauthenticated: []string{
++				"login",
++				"login/*",
++				"oauth",
++				"ci",
++			},
++		},
++
++		Paths: append([]*framework.Path{
++			pathConfig(&b),
++		}, append(
++			append(
++				append(
++					append(
++						allPaths, mfa.MFAPaths(b.Backend, pathLoginToken(&b))...,
++					), mfa.MFAPaths(b.Backend, pathLoginUserPass(&b))...,
++				), mfa.MFAPaths(b.Backend, pathOauthLogin(&b))...,
++			), mfa.MFAPaths(b.Backend, pathLoginJob(&b))...,
++		)...,
++		),
++		AuthRenew:   b.pathLoginRenew,
++		BackendType: logical.TypeCredential,
++	}
++
++	return &b
++}
++
++type backend struct {
++	*framework.Backend
++
++	GroupMap *framework.PolicyMap
++
++	UserMap *framework.PolicyMap
++
++	CipherKey []byte
++}
++
++// Client returns the Gitlab client to communicate to Gitlab via the
++// configured settings.
++
++func (b *backend) TokenClient(token string) *gitlab.Client {
++	tc := cleanhttp.DefaultClient()
++	if strings.HasPrefix(token, "OAuth-") {
++		return gitlab.NewOAuthClient(tc, strings.TrimPrefix(token, "OAuth-"))
++	}
++	return gitlab.NewClient(tc, token)
++}
++
++func (b *backend) UserPassClient(baseURL, username, password string) (*gitlab.Client, error) {
++	tc := cleanhttp.DefaultClient()
++	client, err := gitlab.NewBasicAuthClient(tc, baseURL, username, password)
++	if err != nil {
++		return nil, err
++	}
++	return client, nil
++}
++
++type sudoRoundTripper struct {
++	http.RoundTripper
++	wrapped http.RoundTripper
++	user    string
++}
++
++func (s *sudoRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	req.Header.Set("SUDO", s.user)
++	return s.wrapped.RoundTrip(req)
++}
++
++func (b *backend) JobClient(baseURL, CIToken, project, job, commit, token string) (*gitlab.Client, error) {
++	tc := cleanhttp.DefaultClient()
++	client := gitlab.NewClient(tc, CIToken)
++	client.SetBaseURL(baseURL)
++	jobID, err := strconv.Atoi(job)
++	if err != nil {
++		return nil, err
++	}
++	j, _, err := client.Jobs.GetJob(project, jobID)
++	if err != nil {
++		return nil, err
++	}
++	if j.Status != "running" || j.Commit.ID != commit {
++		return nil, fmt.Errorf("Invalid job arguments : %s %s %s %s", project, job, commit, token)
++	}
++	if err := testJobToken(baseURL, project, jobID, token); err != nil {
++		return nil, err
++	}
++	tc.Transport = &sudoRoundTripper{wrapped: tc.Transport, user: strconv.Itoa(j.User.ID)}
++	return client, nil
++}
++
++func testJobToken(baseURL, project string, jobID int, token string) error {
++	u, err := url.Parse(fmt.Sprintf("%s/projects/%s/jobs/%d/artifacts?job_token=%s", baseURL, project, jobID, token))
++	if err != nil {
++		return err
++	}
++	resp, err := cleanhttp.DefaultClient().Do(&http.Request{
++		Method:     "GET",
++		URL:        u,
++		Proto:      "HTTP/1.1",
++		ProtoMajor: 1,
++		ProtoMinor: 1,
++		Header:     make(http.Header),
++		Host:       u.Host,
++	})
++	if err != nil {
++		return err
++	}
++	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode != http.StatusNotFound {
++		return errors.New(resp.Status)
++	}
++	return nil
++}
++
++func (b *backend) State() (encmess string, err error) {
++	plainText := []byte(strconv.FormatInt(time.Now().UnixNano(), 10))
++
++	block, err := aes.NewCipher(b.CipherKey)
++	if err != nil {
++		return
++	}
++
++	//IV needs to be unique, but doesn't have to be secure.
++	//It's common to put it at the beginning of the ciphertext.
++	cipherText := make([]byte, aes.BlockSize+len(plainText))
++	iv := cipherText[:aes.BlockSize]
++	if _, err = io.ReadFull(rand.Reader, iv); err != nil {
++		return
++	}
++
++	stream := cipher.NewCFBEncrypter(block, iv)
++	stream.XORKeyStream(cipherText[aes.BlockSize:], plainText)
++
++	//returns to base64 encoded string
++	encmess = base64.URLEncoding.EncodeToString(cipherText)
++	return
++}
++
++func (b *backend) CheckState(securemess string) (err error) {
++	now := time.Now().UnixNano()
++	cipherText, err := base64.URLEncoding.DecodeString(securemess)
++	if err != nil {
++		return
++	}
++
++	block, err := aes.NewCipher(b.CipherKey)
++	if err != nil {
++		return
++	}
++
++	if len(cipherText) < aes.BlockSize {
++		err = errors.New("Illegal State")
++		return
++	}
++
++	iv := cipherText[:aes.BlockSize]
++	cipherText = cipherText[aes.BlockSize:]
++
++	stream := cipher.NewCFBDecrypter(block, iv)
++	// XORKeyStream can work in-place if the two arguments are the same.
++	stream.XORKeyStream(cipherText, cipherText)
++
++	decodedmess, err := strconv.ParseInt(string(cipherText), 10, 64)
++	if err == nil && (decodedmess > now || now-decodedmess > 60*int64(time.Second)) {
++		err = errors.New("Illegal State")
++	}
++	return
++}
++
++const backendHelp = `
++The Gitlab credential provider allows authentication via Gitlab.
++
++Users provide a personal access token to log in, and the credential
++provider maps the user to a set of Vault policies according to the groups he is part of.
++After enabling the credential provider, use the "config" route to
++configure it.
++`
+diff --git a/builtin/credential/gitlab/backend_test.go b/builtin/credential/gitlab/backend_test.go
+new file mode 100644
+index 0000000000..500964fc42
+--- /dev/null
++++ b/builtin/credential/gitlab/backend_test.go
+@@ -0,0 +1,164 @@
++package gitlab
++
++import (
++"context"
++"os"
++"strings"
++"testing"
++
++logicaltest "github.com/hashicorp/vault/helper/testhelpers/logical"
++"github.com/hashicorp/vault/sdk/logical"
++)
++
++func TestBackend_Config(t *testing.T) {
++	b, err := Factory(context.Background(), &logical.BackendConfig{
++		Logger: nil,
++	})
++	if err != nil {
++		t.Fatalf("Unable to create backend: %s", err)
++	}
++
++	loginData := map[string]interface{}{
++		// This token has to be replaced with a working token for the test to work.
++		"token": os.Getenv("GITLAB_TOKEN"),
++	}
++	configData := map[string]interface{}{
++		"group": os.Getenv("GITLAB_GROUP"),
++	}
++
++	logicaltest.Test(t, logicaltest.TestCase{
++		PreCheck:       func() { testAccPreCheck(t) },
++		LogicalBackend: b,
++		Steps: []logicaltest.TestStep{
++			testConfigWrite(t, loginData),
++			testLoginWrite(t, configData, false),
++		},
++	})
++}
++
++func testLoginWrite(t *testing.T, d map[string]interface{}, expectFail bool) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "login",
++		ErrorOk:   true,
++		Data:      d,
++		Check: func(resp *logical.Response) error {
++			if resp.IsError() && expectFail {
++				return nil
++			}
++			return nil
++		},
++	}
++}
++
++func testConfigWrite(t *testing.T, d map[string]interface{}) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "config",
++		Data:      d,
++	}
++}
++
++func TestBackend_basic(t *testing.T) {
++	b, err := Factory(context.Background(), &logical.BackendConfig{
++		Logger: nil,
++	})
++	if err != nil {
++		t.Fatalf("Unable to create backend: %s", err)
++	}
++
++	logicaltest.Test(t, logicaltest.TestCase{
++		PreCheck:       func() { testAccPreCheck(t) },
++		LogicalBackend: b,
++		Steps: []logicaltest.TestStep{
++			testAccStepConfig(t, false),
++			testAccMap(t, "default", "fakepol"),
++			testAccMap(t, "oWnErs", "fakepol"),
++			testAccLogin(t, []string{"default", "fakepol"}),
++			testAccStepConfig(t, true),
++			testAccMap(t, "default", "fakepol"),
++			testAccMap(t, "oWnErs", "fakepol"),
++			testAccLogin(t, []string{"default", "fakepol"}),
++			testAccStepConfigWithBaseURL(t),
++			testAccMap(t, "default", "fakepol"),
++			testAccMap(t, "oWnErs", "fakepol"),
++			testAccLogin(t, []string{"default", "fakepol"}),
++			testAccMap(t, "default", "fakepol"),
++			testAccStepConfig(t, true),
++			mapUserToPolicy(t, os.Getenv("GITLAB_USER"), "userpolicy"),
++			testAccLogin(t, []string{"default", "fakepol", "userpolicy"}),
++		},
++	})
++}
++
++func testAccPreCheck(t *testing.T) {
++	if v := os.Getenv("GITLAB_TOKEN"); v == "" {
++		t.Skip("GITLAB_TOKEN must be set for acceptance tests")
++	}
++
++	if v := os.Getenv("GITLAB_GROUP"); v == "" {
++		t.Skip("GITLAB_GROUP must be set for acceptance tests")
++	}
++
++	if v := os.Getenv("GITLAB_BASEURL"); v == "" {
++		t.Skip("GITLAB_BASEURL must be set for acceptance tests (use 'https://gitlab.com/api/v4/' if you don't know what you're doing)")
++	}
++}
++
++func testAccStepConfig(t *testing.T, upper bool) logicaltest.TestStep {
++	ts := logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "config",
++		Data: map[string]interface{}{
++			"organization": os.Getenv("GITLAB_GROUP"),
++		},
++	}
++	if upper {
++		ts.Data["organization"] = strings.ToUpper(os.Getenv("GITLAB_GROUP"))
++	}
++	return ts
++}
++
++func testAccStepConfigWithBaseURL(t *testing.T) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "config",
++		Data: map[string]interface{}{
++			"organization": os.Getenv("GITLAB_GROUP"),
++			"base_url":     os.Getenv("GITLAB_BASEURL"),
++		},
++	}
++}
++
++func testAccMap(t *testing.T, k string, v string) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "map/teams/" + k,
++		Data: map[string]interface{}{
++			"value": v,
++		},
++	}
++}
++
++func mapUserToPolicy(t *testing.T, k string, v string) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "map/users/" + k,
++		Data: map[string]interface{}{
++			"value": v,
++		},
++	}
++}
++
++func testAccLogin(t *testing.T, policies []string) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "login",
++		Data: map[string]interface{}{
++			"token": os.Getenv("GITLAB_TOKEN"),
++		},
++		Unauthenticated: true,
++
++		Check: logicaltest.TestCheckAuth(policies),
++	}
++}
+diff --git a/builtin/credential/gitlab/cli.go b/builtin/credential/gitlab/cli.go
+new file mode 100644
+index 0000000000..705f7a16dd
+--- /dev/null
++++ b/builtin/credential/gitlab/cli.go
+@@ -0,0 +1,98 @@
++package gitlab
++
++import (
++"fmt"
++"io"
++"os"
++"strings"
++
++"github.com/hashicorp/errwrap"
++"github.com/hashicorp/vault/api"
++"github.com/hashicorp/vault/sdk/helper/password"
++)
++
++// CLIHandler structure
++type CLIHandler struct {
++	// for tests
++	testStdout io.Writer
++}
++
++// Auth return secret token
++func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (*api.Secret, error) {
++	mount, ok := m["mount"]
++	if !ok {
++		mount = "gitlab"
++	}
++
++	// Extract or prompt for token
++	token := m["token"]
++	if token == "" {
++		token = os.Getenv("VAULT_AUTH_GITLAB_TOKEN")
++	}
++	if token == "" {
++		// Override the output
++		stdout := h.testStdout
++		if stdout == nil {
++			stdout = os.Stderr
++		}
++
++		var err error
++		fmt.Fprintf(stdout, "Gitlab Access Token (will be hidden): ")
++		token, err = password.Read(os.Stdin)
++		fmt.Fprintf(stdout, "\n")
++		if err != nil {
++			if err == password.ErrInterrupted {
++				return nil, fmt.Errorf("user interrupted")
++			}
++
++			return nil, errwrap.Wrapf("An error occurred attempting to "+
++				"ask for a token. The raw error message is shown below, but usually "+
++				"this is because you attempted to pipe a value into the command or "+
++				"you are executing outside of a terminal (tty). If you want to pipe "+
++				"the value, pass \"-\" as the argument to read from stdin. The raw "+
++				"error was: {{err}}", err)
++		}
++	}
++
++	path := fmt.Sprintf("auth/%s/login", mount)
++	secret, err := c.Logical().Write(path, map[string]interface{}{
++		"token": strings.TrimSpace(token),
++	})
++	if err != nil {
++		return nil, err
++	}
++	if secret == nil {
++		return nil, fmt.Errorf("empty response from credential provider")
++	}
++
++	return secret, nil
++}
++
++// Help return help message
++func (h *CLIHandler) Help() string {
++	help := `
++Usage: vault login -method=gitlab [CONFIG K=V...]
++
++  The Gitlab auth method allows users to authenticate using a Gitlab
++  access token. Users can generate a personal access token from the
++  settings page on their Gitlab account.
++
++  Authenticate using a Gitlab token:
++
++      $ vault login -method=gitlab token=abcd1234
++
++Configuration:
++
++  mount=<string>
++      Path where the Gitlab credential method is mounted. This is usually
++      provided via the -path flag in the "vault login" command, but it can be
++      specified here as well. If specified here, it takes precedence over the
++      value for -path. The default value is "gitlab".
++
++  token=<string>
++      Gitlab access token to use for authentication. If not provided,
++      Vault will prompt for the value.
++`
++
++	return strings.TrimSpace(help)
++}
+diff --git a/builtin/credential/gitlab/cmd/gitlab/main.go b/builtin/credential/gitlab/cmd/gitlab/main.go
+new file mode 100644
+index 0000000000..7e369d1fd6
+--- /dev/null
++++ b/builtin/credential/gitlab/cmd/gitlab/main.go
+@@ -0,0 +1,29 @@
++package main
++
++import (
++	"os"
++
++	hclog "github.com/hashicorp/go-hclog"
++	"github.com/hashicorp/vault/api"
++	"github.com/hashicorp/vault/builtin/credential/gitlab"
++	"github.com/hashicorp/vault/sdk/plugin"
++)
++
++func main() {
++	apiClientMeta := &api.PluginAPIClientMeta{}
++	flags := apiClientMeta.FlagSet()
++	flags.Parse(os.Args[1:])
++
++	tlsConfig := apiClientMeta.GetTLSConfig()
++	tlsProviderFunc := api.VaultPluginTLSProvider(tlsConfig)
++
++	if err := plugin.Serve(&plugin.ServeOpts{
++		BackendFactoryFunc: gitlab.Factory,
++		TLSProviderFunc:    tlsProviderFunc,
++	}); err != nil {
++		logger := hclog.New(&hclog.LoggerOptions{})
++
++		logger.Error("plugin shutting down", "error", err)
++		os.Exit(1)
++	}
++}
+diff --git a/builtin/credential/gitlab/path_config.go b/builtin/credential/gitlab/path_config.go
+new file mode 100644
+index 0000000000..851dc71c37
+--- /dev/null
++++ b/builtin/credential/gitlab/path_config.go
+@@ -0,0 +1,170 @@
++package gitlab
++
++import (
++	"context"
++	"fmt"
++	"net/url"
++
++	"github.com/hashicorp/errwrap"
++	"github.com/hashicorp/vault/sdk/logical"
++	"github.com/hashicorp/vault/sdk/framework"
++	gitlab "github.com/xanzy/go-gitlab"
++)
++
++func pathConfig(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: "config",
++		Fields: map[string]*framework.FieldSchema{
++			"base_url": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "The Gitlab API endpoint to use.",
++			},
++			"min_access_level": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "The minimal project access level that users must have",
++				Default:     "owner",
++			},
++			"app_id": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "The OAuth appId",
++				Default:     "",
++			},
++			"app_secret": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "The OAuth appSecret",
++				Default:     "",
++			},
++			"callback_url": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "The Vault OAuth API endpoint to use.",
++				Default:     "",
++			},
++			"ci_token": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "The CI token API to use.",
++				Default:     "",
++			},
++		},
++
++		Callbacks: map[logical.Operation]framework.OperationFunc{
++			logical.UpdateOperation: b.pathConfigWrite,
++			logical.ReadOperation:   b.pathConfigRead,
++		},
++	}
++}
++
++func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	baseURL := data.Get("base_url").(string)
++	if len(baseURL) > 0 {
++		_, err := url.Parse(baseURL)
++		if err != nil {
++			return logical.ErrorResponse(fmt.Sprintf("Error parsing given base_url: %s", err)), nil
++		}
++	}
++	minAccessLevel := data.Get("min_access_level").(string)
++	appID := data.Get("app_id").(string)
++	appSecret := data.Get("app_secret").(string)
++	callbackURL := data.Get("callback_url").(string)
++	ciToken := data.Get("ci_token").(string)
++	if len(callbackURL) > 0 {
++		_, err := url.Parse(callbackURL)
++		if err != nil {
++			return logical.ErrorResponse(fmt.Sprintf("Error parsing given callback_url: %s", err)), nil
++		}
++	}
++	entry, err := logical.StorageEntryJSON("config", config{
++		BaseURL:        baseURL,
++		MinAccessLevel: minAccessLevel,
++		AppID:          appID,
++		AppSecret:      appSecret,
++		CallbackURL:    callbackURL,
++		CIToken:        ciToken,
++	})
++
++	if err != nil {
++		return nil, err
++	}
++
++	if err := req.Storage.Put(ctx, entry); err != nil {
++		return nil, err
++	}
++
++	return nil, nil
++}
++
++func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++
++	if config == nil {
++		return nil, fmt.Errorf("configuration object not found")
++	}
++
++	resp := &logical.Response{
++		Data: map[string]interface{}{
++			"base_url":         config.BaseURL,
++			"min_access_level": config.MinAccessLevel,
++			"app_id":           config.AppID,
++			"app_secret":       config.AppSecret,
++			"callback_url":     config.CallbackURL,
++			"ci_token":         config.CIToken,
++		},
++	}
++	return resp, nil
++}
++
++// Config returns the configuration for this backend.
++func (b *backend) Config(ctx context.Context, s logical.Storage) (*config, error) {
++	entry, err := s.Get(ctx, "config")
++	if err != nil {
++		return nil, err
++	}
++
++	var result config
++	if entry != nil {
++		if err := entry.DecodeJSON(&result); err != nil {
++			return nil, errwrap.Wrapf("error reading configuration: {{err}}", err)
++		}
++	}
++
++	return &result, nil
++}
++
++func (b *backend) AccessLevelValue(level string) *gitlab.AccessLevelValue {
++	if level == "" {
++		return gitlab.AccessLevel(gitlab.OwnerPermission)
++	}
++	return gitlab.AccessLevel(accessLevelNameToValue[level])
++}
++
++func (b *backend) MinAccessLevelValue(level string) []string {
++	var accessLevelValues []string
++
++	var start = int(*b.AccessLevelValue(level))
++	for k, v := range accessLevelNameToValue {
++		if int(v) >= start {
++			accessLevelValues = append(accessLevelValues, k)
++		}
++	}
++	return accessLevelValues
++}
++
++var accessLevelNameToValue = map[string]gitlab.AccessLevelValue{
++	"none":       gitlab.NoPermissions,
++	"guest":      gitlab.GuestPermissions,
++	"reporter":   gitlab.ReporterPermissions,
++	"developer":  gitlab.DeveloperPermissions,
++	"maintainer": gitlab.MaintainerPermissions,
++	"owner":      gitlab.OwnerPermission,
++}
++
++type config struct {
++	BaseURL        string `json:"baseURL" structs:"baseURL" mapstructure:"baseURL"`
++	MinAccessLevel string `json:"minAccessLevel" structs:"minAccessLevel" mapstructure:"minAccessLevel"`
++	AppID          string `json:"appID" structs:"appID" mapstructure:"appID"`
++	AppSecret      string `json:"appSecret" structs:"appSecret" mapstructure:"appSecret"`
++	CallbackURL    string `json:"callbackURL" structs:"callbackURL" mapstructure:"callbackURL"`
++	CIToken        string `json:"ciToken" structs:"ciToken" mapstructure:"ciToken"`
++}
+diff --git a/builtin/credential/gitlab/path_login.go b/builtin/credential/gitlab/path_login.go
+new file mode 100644
+index 0000000000..3cced89285
+--- /dev/null
++++ b/builtin/credential/gitlab/path_login.go
+@@ -0,0 +1,491 @@
++package gitlab
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/url"
++	"regexp"
++	"sync"
++	"time"
++
++	"golang.org/x/oauth2"
++
++	"github.com/hashicorp/vault/sdk/helper/policyutil"
++	"github.com/hashicorp/vault/sdk/helper/strutil"
++	"github.com/hashicorp/vault/sdk/logical"
++	"github.com/hashicorp/vault/sdk/framework"
++	gitlab "github.com/xanzy/go-gitlab"
++)
++
++func pathLoginToken(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: `login`,
++		Fields: map[string]*framework.FieldSchema{
++			"token": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab API token",
++			},
++		},
++
++		Callbacks: map[logical.Operation]framework.OperationFunc{
++			logical.UpdateOperation:         b.pathLoginByToken,
++			logical.AliasLookaheadOperation: b.pathLoginAliasLookahead,
++		},
++	}
++}
++
++func pathLoginUserPass(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: `login/(?P<username>.+)`,
++		Fields: map[string]*framework.FieldSchema{
++			"username": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab User name",
++			},
++
++			"password": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Password for this user",
++			},
++		},
++
++		Callbacks: map[logical.Operation]framework.OperationFunc{
++			logical.UpdateOperation:         b.pathLoginByUserPass,
++			logical.AliasLookaheadOperation: b.pathLoginAliasLookahead,
++		},
++	}
++}
++
++func pathOauthLogin(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: `oauth`,
++		Fields: map[string]*framework.FieldSchema{
++			"code": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab API code",
++			},
++			"state": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab API state",
++				Default:     "",
++			},
++		},
++
++		Callbacks: map[logical.Operation]framework.OperationFunc{
++			logical.UpdateOperation: b.pathOauthLogin,
++			logical.ReadOperation:   b.pathOauthLogin,
++		},
++	}
++}
++
++func pathLoginJob(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: `ci`,
++		Fields: map[string]*framework.FieldSchema{
++			"project": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab Project id",
++			},
++
++			"job": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab Job id",
++			},
++
++			"commit": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab Commit id",
++			},
++
++			"token": &framework.FieldSchema{
++				Type:        framework.TypeString,
++				Description: "Gitlab Job token",
++			},
++		},
++
++		Callbacks: map[logical.Operation]framework.OperationFunc{
++			logical.UpdateOperation:         b.pathLoginByJob,
++			logical.AliasLookaheadOperation: b.pathLoginAliasLookahead,
++		},
++	}
++}
++
++func (b *backend) pathLoginByToken(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, b.TokenClient(data.Get("token").(string))); err != nil {
++		return nil, err
++	} else if resp != nil {
++		return resp, nil
++	} else {
++		return b.pathLoginOk(verifyResponse, map[string]interface{}{
++			"token": data.Get("token").(string),
++		}), nil
++	}
++}
++
++func (b *backend) pathLoginByUserPass(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++	client, err := b.UserPassClient(config.BaseURL, data.Get("username").(string), data.Get("password").(string))
++	if err != nil {
++		return nil, err
++	}
++
++	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, client); err != nil {
++		return nil, err
++	} else if resp != nil {
++		return resp, nil
++	} else {
++		return b.pathLoginOk(verifyResponse, map[string]interface{}{
++			"username": data.Get("username").(string),
++			"password": data.Get("password").(string),
++		}), nil
++	}
++}
++
++func (b *backend) pathLoginAliasLookahead(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	token, ok := data.GetOk("token")
++	if !ok {
++		token = ""
++	}
++	username, ok := data.GetOk("username")
++	if !ok {
++		username = ""
++	}
++	password, ok := data.GetOk("password")
++	if !ok {
++		password = ""
++	}
++
++	var client *gitlab.Client
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++	if token != "" {
++		client = b.TokenClient(token.(string))
++	} else if username != "" {
++		client, err = b.UserPassClient(config.BaseURL, username.(string), password.(string))
++		if err != nil {
++			return nil, err
++		}
++	} else {
++		return nil, errors.New("unknow client type")
++	}
++
++	var verifyResp *verifyCredentialsResp
++	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, client); err != nil {
++		return nil, err
++	} else if resp != nil {
++		return resp, nil
++	} else {
++		verifyResp = verifyResponse
++	}
++
++	return &logical.Response{
++		Auth: &logical.Auth{
++			Alias: &logical.Alias{
++				Name: verifyResp.Username,
++			},
++			EntityID: verifyResp.Username,
++		},
++	}, nil
++}
++
++func (b *backend) pathLoginOk(verifyResp *verifyCredentialsResp, internalData map[string]interface{}) *logical.Response {
++	resp := &logical.Response{
++		Auth: &logical.Auth{
++			InternalData: internalData,
++			Metadata: map[string]string{
++				"username": verifyResp.Username,
++			},
++			DisplayName: verifyResp.Username,
++			LeaseOptions: logical.LeaseOptions{
++				Renewable: true,
++			},
++			Alias: &logical.Alias{
++				Name: verifyResp.Username,
++			},
++			EntityID: verifyResp.Username,
++		},
++	}
++
++	if verifyResp.IsAdmin {
++		if b.Logger().IsDebug() {
++			b.Logger().Debug("User " + verifyResp.Username + " is admin")
++		}
++		resp.Auth.Policies = append(resp.Auth.Policies, "admins")
++	}
++
++	aliasNames := append(verifyResp.ProjectNames, verifyResp.GroupNames...)
++	aliasNames = strutil.RemoveEmpty(strutil.RemoveDuplicates(aliasNames, true))
++
++	for _, name := range aliasNames {
++		resp.Auth.GroupAliases = append(resp.Auth.GroupAliases, &logical.Alias{
++			Name: name,
++		})
++	}
++
++	re := regexp.MustCompile(`[^\w]+`)
++	for _, name := range aliasNames {
++		resp.Auth.Policies = append(resp.Auth.Policies, re.ReplaceAllString(name, `_`))
++	}
++
++	return resp
++}
++
++func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
++	if req.Auth == nil {
++		return nil, fmt.Errorf("request auth was nil")
++	}
++
++	tokenRaw, ok := req.Auth.InternalData["token"]
++	if !ok {
++		return nil, fmt.Errorf("token created in previous version of Vault cannot be validated properly at renewal time")
++	}
++	token := tokenRaw.(string)
++
++	var verifyResp *verifyCredentialsResp
++	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, b.TokenClient(token)); err != nil {
++		return nil, err
++	} else if resp != nil {
++		return resp, nil
++	} else {
++		verifyResp = verifyResponse
++	}
++	aliasNames := append(verifyResp.ProjectNames, verifyResp.GroupNames...)
++	aliasNames = strutil.RemoveEmpty(strutil.RemoveDuplicates(aliasNames, true))
++
++	if !policyutil.EquivalentPolicies(aliasNames, req.Auth.TokenPolicies) {
++		return nil, fmt.Errorf("policies do not match")
++	}
++
++	resp := &logical.Response{Auth: req.Auth}
++	// Remove old aliases
++	resp.Auth.GroupAliases = nil
++
++	for _, name := range aliasNames {
++		resp.Auth.GroupAliases = append(resp.Auth.GroupAliases, &logical.Alias{
++			Name: name,
++		})
++	}
++
++	re := regexp.MustCompile(`[^\w]+`)
++	for _, name := range aliasNames {
++		resp.Auth.Policies = append(resp.Auth.Policies, re.ReplaceAllString(name, `_`))
++	}
++
++	return resp, nil
++}
++
++func (b *backend) verifyCredentials(ctx context.Context, req *logical.Request, client *gitlab.Client) (*verifyCredentialsResp, *logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, nil, err
++	}
++	client.SetBaseURL(config.BaseURL)
++
++	// Get the user
++	user, _, err := client.Users.CurrentUser()
++	if err != nil {
++		return nil, nil, err
++	}
++
++	username := user.Username
++	isAdmin := user.IsAdmin
++
++	var projectNames, groupNames *[]string
++	var mux = &sync.Mutex{}
++	var wg sync.WaitGroup
++
++	var errorVerify error
++	for _, accessLevel := range b.MinAccessLevelValue(config.MinAccessLevel) {
++		wg.Add(1)
++		go func(accessLevel string) {
++			defer wg.Done()
++			optProjects := &gitlab.ListProjectsOptions{
++				MinAccessLevel: b.AccessLevelValue(accessLevel),
++				ListOptions: gitlab.ListOptions{
++					PerPage: 100,
++				},
++			}
++			for errorVerify == nil {
++				projects, resp, err := client.Projects.ListProjects(optProjects)
++				if err != nil {
++					errorVerify = err
++					return
++				}
++				t := []string{}
++				for _, p := range projects {
++					t = append(t, p.PathWithNamespace+"_"+accessLevel)
++				}
++				mux.Lock()
++				if projectNames != nil {
++					t = append(*projectNames, t...)
++				}
++				projectNames = &t
++				mux.Unlock()
++				if resp.NextPage == 0 {
++					break
++				}
++				optProjects.Page = resp.NextPage
++			}
++		}(accessLevel)
++
++		wg.Add(1)
++		go func(accessLevel string) {
++			defer wg.Done()
++			optGroups := &gitlab.ListGroupsOptions{
++				MinAccessLevel: b.AccessLevelValue(accessLevel),
++				ListOptions: gitlab.ListOptions{
++					PerPage: 100,
++				},
++			}
++			var allGroups []*gitlab.Group
++			for errorVerify == nil {
++				groups, resp, err := client.Groups.ListGroups(optGroups)
++				if err != nil {
++					errorVerify = err
++					return
++				}
++				t := []string{}
++				for _, g := range groups {
++					t = append(t, g.FullPath+"_"+accessLevel)
++				}
++				mux.Lock()
++				if groupNames != nil {
++					t = append(*groupNames, t...)
++				}
++				groupNames = &t
++				mux.Unlock()
++				if resp.NextPage == 0 {
++					break
++				}
++				optGroups.Page = resp.NextPage
++			}
++			for _, g := range allGroups {
++				mux.Lock()
++				t := append(*groupNames, g.FullPath+"_"+accessLevel)
++				groupNames = &t
++				mux.Unlock()
++			}
++		}(accessLevel)
++	}
++	wg.Wait()
++
++	if errorVerify != nil {
++		return nil, nil, errorVerify
++	}
++
++	return &verifyCredentialsResp{
++		Username:     username,
++		ProjectNames: *projectNames,
++		GroupNames:   *groupNames,
++		IsAdmin:      isAdmin,
++	}, nil, nil
++}
++
++func (b *backend) pathOauthLogin(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++
++	if config.AppSecret == "" || config.AppID == "" || config.CallbackURL == "" {
++		return nil, fmt.Errorf("config OAuth disabled")
++	}
++
++	baseURL, _ := url.Parse(config.BaseURL)
++	callbackURL, _ := url.Parse(config.CallbackURL)
++
++	oauth2Conf := &oauth2.Config{
++		ClientID:     config.AppID,
++		ClientSecret: config.AppSecret,
++		Endpoint: oauth2.Endpoint{
++			AuthURL:  fmt.Sprintf("%s://%s/oauth/authorize", baseURL.Scheme, baseURL.Host),
++			TokenURL: fmt.Sprintf("%s://%s/oauth/token", baseURL.Scheme, baseURL.Host),
++		},
++		Scopes:      []string{"api", "read_user"},
++		RedirectURL: fmt.Sprintf("%s://%s/v1/%s%s", callbackURL.Scheme, callbackURL.Host, req.MountPoint, req.Path),
++	}
++
++	code, _ := data.GetOk("code")
++
++	if code != nil {
++		state := data.Get("state")
++		err = b.CheckState(state.(string))
++		if err != nil {
++			return nil, err
++		}
++
++		token, err := oauth2Conf.Exchange(ctx, code.(string))
++		if err != nil {
++			return nil, err
++		}
++		if verifyResponse, resp, err := b.verifyCredentials(ctx, req, b.TokenClient("OAuth-"+token.AccessToken)); err != nil {
++			return nil, err
++		} else if resp != nil {
++			return resp, nil
++		} else {
++			response := b.pathLoginOk(verifyResponse, map[string]interface{}{
++				"token": token.AccessToken,
++			})
++
++			wrappedResponse, err := b.System().ResponseWrapData(ctx, map[string]interface{}{
++				"authType": "gitlab",
++				"token":    "OAuth-" + token.AccessToken,
++			}, time.Second*60, false)
++			if err != nil {
++				return nil, err
++			}
++			response.Redirect = "/ui/vault/auth?with=gitlab&wrapped_token=" + wrappedResponse.Token
++
++			return response, nil
++		}
++	} else {
++		state, err := b.State()
++		if err != nil {
++			return nil, err
++		}
++		return &logical.Response{
++			Redirect: oauth2Conf.AuthCodeURL(state, oauth2.AccessTypeOffline),
++		}, nil
++	}
++
++}
++
++func (b *backend) pathLoginByJob(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++	if config.CIToken == "" {
++		return nil, fmt.Errorf("config CI access disabled")
++	}
++	client, err := b.JobClient(config.BaseURL, config.CIToken, data.Get("project").(string), data.Get("job").(string), data.Get("commit").(string), data.Get("token").(string))
++	if err != nil {
++		return nil, err
++	}
++
++	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, client); err != nil {
++		return nil, err
++	} else if resp != nil {
++		return resp, nil
++	} else {
++		return b.pathLoginOk(verifyResponse, map[string]interface{}{
++			"project": data.Get("project").(string),
++			"job":     data.Get("job").(string),
++			"commit":  data.Get("commit").(string),
++			"token":   data.Get("token").(string),
++		}), nil
++	}
++}
++
++type verifyCredentialsResp struct {
++	Username     string
++	ProjectNames []string
++	GroupNames   []string
++	IsAdmin      bool
++}
+diff --git a/command/base_predict.go b/command/base_predict.go
+index 13959bb5bc..01ae8d41c1 100644
+--- a/command/base_predict.go
++++ b/command/base_predict.go
+@@ -108,6 +108,7 @@ func (b *BaseCommand) PredictVaultAvailableAuths() complete.Predictor {
+ 		"cert",
+ 		"gcp",
+ 		"github",
++		"gitlab",
+ 		"ldap",
+ 		"okta",
+ 		"plugin",
+diff --git a/command/base_predict_test.go b/command/base_predict_test.go
+index 12f364106f..ccf789d051 100644
+--- a/command/base_predict_test.go
++++ b/command/base_predict_test.go
+@@ -358,6 +358,7 @@ func TestPredict_Plugins(t *testing.T) {
+ 				"gcp",
+ 				"gcpkms",
+ 				"github",
++				"gitlab",
+ 				"hana-database-plugin",
+ 				"influxdb-database-plugin",
+ 				"jwt",
+diff --git a/command/commands.go b/command/commands.go
+index dc08c4a746..b69d793782 100644
+--- a/command/commands.go
++++ b/command/commands.go
+@@ -33,6 +33,7 @@ import (
+ 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
+ 	credCert "github.com/hashicorp/vault/builtin/credential/cert"
+ 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
+ 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
+ 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
+ 	credToken "github.com/hashicorp/vault/builtin/credential/token"
+@@ -188,6 +189,7 @@ func initCommands(ui, serverCmdUi cli.Ui, runOpts *RunOptions) {
+ 		"cf":       &credCF.CLIHandler{},
+ 		"gcp":      &credGcp.CLIHandler{},
+ 		"github":   &credGitHub.CLIHandler{},
++		"gitlab":   &credGitlab.CLIHandler{},
+ 		"kerberos": &credKerb.CLIHandler{},
+ 		"ldap":     &credLdap.CLIHandler{},
+ 		"oci":      &credOCI.CLIHandler{},
+diff --git a/go.mod b/go.mod
+index bf957964b1..11b8e29276 100644
+--- a/go.mod
++++ b/go.mod
+@@ -159,6 +159,7 @@ require (
+ 	github.com/sethvargo/go-limiter v0.7.1
+ 	github.com/shirou/gopsutil v3.21.5+incompatible
+ 	github.com/stretchr/testify v1.7.0
++	github.com/xanzy/go-gitlab v0.19.0
+ 	go.etcd.io/bbolt v1.3.6
+ 	go.etcd.io/etcd/client/pkg/v3 v3.5.0
+ 	go.etcd.io/etcd/client/v2 v2.305.0
+diff --git a/go.sum b/go.sum
+index 624f76b0d3..b40bcdf8e9 100644
+--- a/go.sum
++++ b/go.sum
+@@ -1507,6 +1507,9 @@ github.com/urfave/cli v0.0.0-20171014202726-7bc6a0acffa5/go.mod h1:70zkFmudgCuE/
+ github.com/urfave/cli v1.20.0/go.mod h1:70zkFmudgCuE/ngEzBv17Jvp/497gISqfk5gWijbERA=
+ github.com/urfave/cli v1.22.1/go.mod h1:Gos4lmkARVdJ6EkW0WaNv/tZAAMe9V7XWyB60NtXRu0=
+ github.com/urfave/cli v1.22.2/go.mod h1:Gos4lmkARVdJ6EkW0WaNv/tZAAMe9V7XWyB60NtXRu0=
++github.com/xanzy/go-gitlab v0.19.0 h1:WHw/JqUiQ82itbuB4IDS4AgTy8RQ0CBrbfljq65pJCo=
++github.com/xanzy/go-gitlab v0.19.0/go.mod h1:LSfUQ9OPDnwRqulJk2HcWaAiFfCzaknyeGvjQI67MbE=
++
+ github.com/vishvananda/netlink v0.0.0-20181108222139-023a6dafdcdf/go.mod h1:+SR5DhBJrl6ZM7CoCKvpw5BKroDKQ+PJqOg65H/2ktk=
+ github.com/vishvananda/netlink v1.1.0/go.mod h1:cTgwzPIzzgDAYoQrMm0EdrjRUBkTqKYppBueQtXaqoE=
+ github.com/vishvananda/netlink v1.1.1-0.20201029203352-d40f9887b852/go.mod h1:twkDnbuQxJYemMlGd4JFIcuhgX83tXhKS2B/PRMpOho=
+diff --git a/helper/builtinplugins/registry.go b/helper/builtinplugins/registry.go
+index 325658654b..037bfffacb 100644
+--- a/helper/builtinplugins/registry.go
++++ b/helper/builtinplugins/registry.go
+@@ -28,6 +28,7 @@ import (
+ 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
+ 	credCert "github.com/hashicorp/vault/builtin/credential/cert"
+ 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
+ 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
+ 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
+ 	credRadius "github.com/hashicorp/vault/builtin/credential/radius"
+@@ -80,6 +81,7 @@ func newRegistry() *registry {
+ 			"cf":         credCF.Factory,
+ 			"gcp":        credGcp.Factory,
+ 			"github":     credGitHub.Factory,
++			"gitlab":     credGitlab.Factory,
+ 			"jwt":        credJWT.Factory,
+ 			"kerberos":   credKerb.Factory,
+ 			"kubernetes": credKube.Factory,
+diff --git a/scripts/gen_openapi.sh b/scripts/gen_openapi.sh
+index 74946bf698..0c51facd8c 100755
+--- a/scripts/gen_openapi.sh
++++ b/scripts/gen_openapi.sh
+@@ -34,6 +34,7 @@ vault auth enable cert
+ vault auth enable cf
+ vault auth enable gcp
+ vault auth enable github
++vault auth enable gitlab
+ vault auth enable jwt
+ vault auth enable kerberos
+ vault auth enable kubernetes
+diff --git a/sdk/version/version_base.go b/sdk/version/version_base.go
+index fa3d1ded93..2b26c644dd 100644
+--- a/sdk/version/version_base.go
++++ b/sdk/version/version_base.go
+@@ -9,6 +9,6 @@ var (
+ 	CgoEnabled bool
+ 
+ 	Version           = "1.9.2"
+-	VersionPrerelease = ""
++	VersionPrerelease = "beys"
+ 	VersionMetadata   = ""
+ )
+diff --git a/ui/app/adapters/auth-config/gitlab.js b/ui/app/adapters/auth-config/gitlab.js
+new file mode 100644
+index 0000000000..21f5624ac4
+--- /dev/null
++++ b/ui/app/adapters/auth-config/gitlab.js
+@@ -0,0 +1,2 @@
++import AuthConfig from './_base';
++export default AuthConfig.extend();
+diff --git a/ui/app/adapters/cluster.js b/ui/app/adapters/cluster.js
+index 032b77c755..2f26f3cf7f 100644
+--- a/ui/app/adapters/cluster.js
++++ b/ui/app/adapters/cluster.js
+@@ -8,208 +8,209 @@ import { pluralize } from 'ember-inflector';
+ import ApplicationAdapter from './application';
+ 
+ const ENDPOINTS = [
+-  'health',
+-  'seal-status',
+-  'tokens',
+-  'token',
+-  'seal',
+-  'unseal',
+-  'init',
+-  'capabilities-self',
+-  'license',
++    'health',
++    'seal-status',
++    'tokens',
++    'token',
++    'seal',
++    'unseal',
++    'init',
++    'capabilities-self',
++    'license',
+ ];
+ 
+ const REPLICATION_ENDPOINTS = {
+-  reindex: 'reindex',
+-  recover: 'recover',
+-  status: 'status',
++    reindex: 'reindex',
++    recover: 'recover',
++    status: 'status',
+ 
+-  primary: ['enable', 'disable', 'demote', 'secondary-token', 'revoke-secondary'],
++    primary: ['enable', 'disable', 'demote', 'secondary-token', 'revoke-secondary'],
+ 
+-  secondary: ['enable', 'disable', 'promote', 'update-primary'],
++    secondary: ['enable', 'disable', 'promote', 'update-primary'],
+ };
+ 
+ const REPLICATION_MODES = ['dr', 'performance'];
+ export default ApplicationAdapter.extend({
+-  version: service(),
+-  namespaceService: service('namespace'),
+-  shouldBackgroundReloadRecord() {
+-    return true;
+-  },
+-
+-  findRecord(store, type, id, snapshot) {
+-    let fetches = {
+-      health: this.health(),
+-      sealStatus: this.sealStatus().catch(e => e),
+-    };
+-    if (this.version.isEnterprise && this.namespaceService.inRootNamespace) {
+-      fetches.replicationStatus = this.replicationStatus().catch(e => e);
+-    }
+-    return hash(fetches).then(({ health, sealStatus, replicationStatus }) => {
+-      let ret = {
+-        id,
+-        name: snapshot.attr('name'),
+-      };
+-      ret = assign(ret, health);
+-      if (sealStatus instanceof AdapterError === false) {
+-        ret = assign(ret, { nodes: [sealStatus] });
+-      }
+-      if (replicationStatus && replicationStatus instanceof AdapterError === false) {
+-        ret = assign(ret, replicationStatus.data);
+-      }
+-      return resolve(ret);
+-    });
+-  },
+-
+-  pathForType(type) {
+-    return type === 'cluster' ? 'clusters' : pluralize(type);
+-  },
+-
+-  health() {
+-    return this.ajax(this.urlFor('health'), 'GET', {
+-      data: {
+-        standbycode: 200,
+-        sealedcode: 200,
+-        uninitcode: 200,
+-        drsecondarycode: 200,
+-        performancestandbycode: 200,
+-      },
+-      unauthenticated: true,
+-    });
+-  },
+-
+-  features() {
+-    return this.ajax(`${this.urlFor('license')}/features`, 'GET', {
+-      unauthenticated: true,
+-    });
+-  },
+-
+-  sealStatus() {
+-    return this.ajax(this.urlFor('seal-status'), 'GET', { unauthenticated: true });
+-  },
+-
+-  seal() {
+-    return this.ajax(this.urlFor('seal'), 'PUT');
+-  },
+-
+-  unseal(data) {
+-    return this.ajax(this.urlFor('unseal'), 'PUT', {
+-      data,
+-      unauthenticated: true,
+-    });
+-  },
+-
+-  initCluster(data) {
+-    return this.ajax(this.urlFor('init'), 'PUT', {
+-      data,
+-      unauthenticated: true,
+-    });
+-  },
+-
+-  authenticate({ backend, data }) {
+-    const { role, jwt, token, password, username, path } = data;
+-    const url = this.urlForAuth(backend, username, path);
+-    const verb = backend === 'token' ? 'GET' : 'POST';
+-    let options = {
+-      unauthenticated: true,
+-    };
+-    if (backend === 'token') {
+-      options.headers = {
+-        'X-Vault-Token': token,
+-      };
+-    } else if (backend === 'jwt' || backend === 'oidc') {
+-      options.data = { role, jwt };
+-    } else {
+-      options.data = token ? { token, password } : { password };
+-    }
+-
+-    return this.ajax(url, verb, options);
+-  },
+-
+-  urlFor(endpoint) {
+-    if (!ENDPOINTS.includes(endpoint)) {
+-      throw new Error(
+-        `Calls to a ${endpoint} endpoint are not currently allowed in the vault cluster adapater`
+-      );
+-    }
+-    return `${this.buildURL()}/${endpoint}`;
+-  },
+-
+-  urlForAuth(type, username, path) {
+-    const authBackend = type.toLowerCase();
+-    const authURLs = {
+-      github: 'login',
+-      jwt: 'login',
+-      oidc: 'login',
+-      userpass: `login/${encodeURIComponent(username)}`,
+-      ldap: `login/${encodeURIComponent(username)}`,
+-      okta: `login/${encodeURIComponent(username)}`,
+-      radius: `login/${encodeURIComponent(username)}`,
+-      token: 'lookup-self',
+-    };
+-    const urlSuffix = authURLs[authBackend];
+-    const urlPrefix = path && authBackend !== 'token' ? path : authBackend;
+-    if (!urlSuffix) {
+-      throw new Error(`There is no auth url for ${type}.`);
+-    }
+-    return `/v1/auth/${urlPrefix}/${urlSuffix}`;
+-  },
+-
+-  urlForReplication(replicationMode, clusterMode, endpoint) {
+-    let suffix;
+-    const errString = `Calls to replication ${endpoint} endpoint are not currently allowed in the vault cluster adapater`;
+-    if (clusterMode) {
+-      assert(errString, REPLICATION_ENDPOINTS[clusterMode].includes(endpoint));
+-      suffix = `${replicationMode}/${clusterMode}/${endpoint}`;
+-    } else {
+-      assert(errString, REPLICATION_ENDPOINTS[endpoint]);
+-      suffix = `${endpoint}`;
+-    }
+-    return `${this.buildURL()}/replication/${suffix}`;
+-  },
+-
+-  replicationStatus() {
+-    return this.ajax(`${this.buildURL()}/replication/status`, 'GET', { unauthenticated: true });
+-  },
+-
+-  replicationDrPromote(data, options) {
+-    const verb = options && options.checkStatus ? 'GET' : 'PUT';
+-    return this.ajax(`${this.buildURL()}/replication/dr/secondary/promote`, verb, {
+-      data,
+-      unauthenticated: true,
+-    });
+-  },
+-
+-  generateDrOperationToken(data, options) {
+-    let verb = options && options.checkStatus ? 'GET' : 'PUT';
+-    if (options.cancel) {
+-      verb = 'DELETE';
+-    }
+-    let url = `${this.buildURL()}/replication/dr/secondary/generate-operation-token/`;
+-    if (!data || data.pgp_key || data.attempt) {
+-      // start the generation
+-      url = url + 'attempt';
+-    } else {
+-      // progress the operation
+-      url = url + 'update';
+-    }
+-    return this.ajax(url, verb, {
+-      data,
+-      unauthenticated: true,
+-    });
+-  },
+-
+-  replicationAction(action, replicationMode, clusterMode, data) {
+-    assert(
+-      `${replicationMode} is an unsupported replication mode.`,
+-      replicationMode && REPLICATION_MODES.includes(replicationMode)
+-    );
+-
+-    const url =
+-      action === 'recover' || action === 'reindex'
+-        ? this.urlForReplication(replicationMode, null, action)
+-        : this.urlForReplication(replicationMode, clusterMode, action);
+-
+-    return this.ajax(url, 'POST', { data });
+-  },
++    version: service(),
++    namespaceService: service('namespace'),
++    shouldBackgroundReloadRecord() {
++        return true;
++    },
++
++    findRecord(store, type, id, snapshot) {
++        let fetches = {
++            health: this.health(),
++            sealStatus: this.sealStatus().catch(e => e),
++        };
++        if (this.version.isEnterprise && this.namespaceService.inRootNamespace) {
++            fetches.replicationStatus = this.replicationStatus().catch(e => e);
++        }
++        return hash(fetches).then(({ health, sealStatus, replicationStatus }) => {
++            let ret = {
++                id,
++                name: snapshot.attr('name'),
++            };
++            ret = assign(ret, health);
++            if (sealStatus instanceof AdapterError === false) {
++                ret = assign(ret, { nodes: [sealStatus] });
++            }
++            if (replicationStatus && replicationStatus instanceof AdapterError === false) {
++                ret = assign(ret, replicationStatus.data);
++            }
++            return resolve(ret);
++        });
++    },
++
++    pathForType(type) {
++        return type === 'cluster' ? 'clusters' : pluralize(type);
++    },
++
++    health() {
++        return this.ajax(this.urlFor('health'), 'GET', {
++            data: {
++                standbycode: 200,
++                sealedcode: 200,
++                uninitcode: 200,
++                drsecondarycode: 200,
++                performancestandbycode: 200,
++            },
++            unauthenticated: true,
++        });
++    },
++
++    features() {
++        return this.ajax(`${this.urlFor('license')}/features`, 'GET', {
++            unauthenticated: true,
++        });
++    },
++
++    sealStatus() {
++        return this.ajax(this.urlFor('seal-status'), 'GET', { unauthenticated: true });
++    },
++
++    seal() {
++        return this.ajax(this.urlFor('seal'), 'PUT');
++    },
++
++    unseal(data) {
++        return this.ajax(this.urlFor('unseal'), 'PUT', {
++            data,
++            unauthenticated: true,
++        });
++    },
++
++    initCluster(data) {
++        return this.ajax(this.urlFor('init'), 'PUT', {
++            data,
++            unauthenticated: true,
++        });
++    },
++
++    authenticate({ backend, data }) {
++        const { role, jwt, token, password, username, path } = data;
++        const url = this.urlForAuth(backend, username, path);
++        const verb = backend === 'token' ? 'GET' : 'POST';
++        let options = {
++            unauthenticated: true,
++        };
++        if (backend === 'token') {
++            options.headers = {
++                'X-Vault-Token': token,
++            };
++        } else if (backend === 'jwt' || backend === 'oidc') {
++            options.data = { role, jwt };
++        } else {
++            options.data = token ? { token, password } : { password };
++        }
++
++        return this.ajax(url, verb, options);
++    },
++
++    urlFor(endpoint) {
++        if (!ENDPOINTS.includes(endpoint)) {
++            throw new Error(
++                `Calls to a ${endpoint} endpoint are not currently allowed in the vault cluster adapater`
++            );
++        }
++        return `${this.buildURL()}/${endpoint}`;
++    },
++
++    urlForAuth(type, username, path) {
++        const authBackend = type.toLowerCase();
++        const authURLs = {
++            github: 'login',
++            gitlab: username ? `login/${encodeURIComponent(username)}` : 'login',
++            jwt: 'login',
++            oidc: 'login',
++            userpass: `login/${encodeURIComponent(username)}`,
++            ldap: `login/${encodeURIComponent(username)}`,
++            okta: `login/${encodeURIComponent(username)}`,
++            radius: `login/${encodeURIComponent(username)}`,
++            token: 'lookup-self',
++        };
++        const urlSuffix = authURLs[authBackend];
++        const urlPrefix = path && authBackend !== 'token' ? path : authBackend;
++        if (!urlSuffix) {
++            throw new Error(`There is no auth url for ${type}.`);
++        }
++        return `/v1/auth/${urlPrefix}/${urlSuffix}`;
++    },
++
++    urlForReplication(replicationMode, clusterMode, endpoint) {
++        let suffix;
++        const errString = `Calls to replication ${endpoint} endpoint are not currently allowed in the vault cluster adapater`;
++        if (clusterMode) {
++            assert(errString, REPLICATION_ENDPOINTS[clusterMode].includes(endpoint));
++            suffix = `${replicationMode}/${clusterMode}/${endpoint}`;
++        } else {
++            assert(errString, REPLICATION_ENDPOINTS[endpoint]);
++            suffix = `${endpoint}`;
++        }
++        return `${this.buildURL()}/replication/${suffix}`;
++    },
++
++    replicationStatus() {
++        return this.ajax(`${this.buildURL()}/replication/status`, 'GET', { unauthenticated: true });
++    },
++
++    replicationDrPromote(data, options) {
++        const verb = options && options.checkStatus ? 'GET' : 'PUT';
++        return this.ajax(`${this.buildURL()}/replication/dr/secondary/promote`, verb, {
++            data,
++            unauthenticated: true,
++        });
++    },
++
++    generateDrOperationToken(data, options) {
++        let verb = options && options.checkStatus ? 'GET' : 'PUT';
++        if (options.cancel) {
++            verb = 'DELETE';
++        }
++        let url = `${this.buildURL()}/replication/dr/secondary/generate-operation-token/`;
++        if (!data || data.pgp_key || data.attempt) {
++            // start the generation
++            url = url + 'attempt';
++        } else {
++            // progress the operation
++            url = url + 'update';
++        }
++        return this.ajax(url, verb, {
++            data,
++            unauthenticated: true,
++        });
++    },
++
++    replicationAction(action, replicationMode, clusterMode, data) {
++        assert(
++            `${replicationMode} is an unsupported replication mode.`,
++            replicationMode && REPLICATION_MODES.includes(replicationMode)
++        );
++
++        const url =
++            action === 'recover' || action === 'reindex'
++                ? this.urlForReplication(replicationMode, null, action)
++                : this.urlForReplication(replicationMode, clusterMode, action);
++
++        return this.ajax(url, 'POST', { data });
++    },
+ });
+diff --git a/ui/app/components/auth-form.js b/ui/app/components/auth-form.js
+index 9e24fc3c9a..0dba4c26c0 100644
+--- a/ui/app/components/auth-form.js
++++ b/ui/app/components/auth-form.js
+@@ -26,273 +26,281 @@ const BACKENDS = supportedAuthBackends();
+  */
+ 
+ const DEFAULTS = {
+-  token: null,
+-  username: null,
+-  password: null,
+-  customPath: null,
++    token: null,
++    username: null,
++    password: null,
++    customPath: null,
+ };
+ 
+ export default Component.extend(DEFAULTS, {
+-  router: service(),
+-  auth: service(),
+-  flashMessages: service(),
+-  store: service(),
+-  csp: service('csp-event'),
++    router: service(),
++    auth: service(),
++    flashMessages: service(),
++    store: service(),
++    csp: service('csp-event'),
+ 
+-  //  passed in via a query param
+-  selectedAuth: null,
+-  methods: null,
+-  cluster: null,
+-  redirectTo: null,
+-  namespace: null,
+-  wrappedToken: null,
+-  // internal
+-  oldNamespace: null,
++    //  passed in via a query param
++    selectedAuth: null,
++    methods: null,
++    cluster: null,
++    redirectTo: null,
++    namespace: null,
++    wrappedToken: null,
++    // internal
++    oldNamespace: null,
+ 
+-  didReceiveAttrs() {
+-    this._super(...arguments);
+-    let {
+-      wrappedToken: token,
+-      oldWrappedToken: oldToken,
+-      oldNamespace: oldNS,
+-      namespace: ns,
+-      selectedAuth: newMethod,
+-      oldSelectedAuth: oldMethod,
+-    } = this;
++    didReceiveAttrs() {
++        this._super(...arguments);
++        let {
++            wrappedToken: token,
++            oldWrappedToken: oldToken,
++            oldNamespace: oldNS,
++            namespace: ns,
++            selectedAuth: newMethod,
++            oldSelectedAuth: oldMethod,
++        } = this;
+ 
+-    next(() => {
+-      if (!token && (oldNS === null || oldNS !== ns)) {
+-        this.fetchMethods.perform();
+-      }
+-      this.set('oldNamespace', ns);
+-      // we only want to trigger this once
+-      if (token && !oldToken) {
+-        this.unwrapToken.perform(token);
+-        this.set('oldWrappedToken', token);
+-      }
+-      if (oldMethod && oldMethod !== newMethod) {
+-        this.resetDefaults();
+-      }
+-      this.set('oldSelectedAuth', newMethod);
+-    });
+-  },
++        next(() => {
++            if (!token && (oldNS === null || oldNS !== ns)) {
++                this.fetchMethods.perform();
++            }
++            this.set('oldNamespace', ns);
++            // we only want to trigger this once
++            if (token && !oldToken) {
++                this.unwrapToken.perform(token);
++                this.set('oldWrappedToken', token);
++            }
++            if (oldMethod && oldMethod !== newMethod) {
++                this.resetDefaults();
++            }
++            this.set('oldSelectedAuth', newMethod);
++        });
++    },
+ 
+-  didRender() {
+-    this._super(...arguments);
+-    // on very narrow viewports the active tab may be overflowed, so we scroll it into view here
+-    let activeEle = this.element.querySelector('li.is-active');
+-    if (activeEle) {
+-      activeEle.scrollIntoView();
+-    }
++    didRender() {
++        this._super(...arguments);
++        // on very narrow viewports the active tab may be overflowed, so we scroll it into view here
++        let activeEle = this.element.querySelector('li.is-active');
++        if (activeEle) {
++            activeEle.scrollIntoView();
++        }
+ 
+-    next(() => {
+-      let firstMethod = this.firstMethod();
+-      // set `with` to the first method
+-      if (
+-        !this.wrappedToken &&
+-        ((this.fetchMethods.isIdle && firstMethod && !this.selectedAuth) ||
+-          (this.selectedAuth && !this.selectedAuthBackend))
+-      ) {
+-        this.set('selectedAuth', firstMethod);
+-      }
+-    });
+-  },
++        next(() => {
++            let firstMethod = this.firstMethod();
++            // set `with` to the first method
++            if (
++                !this.wrappedToken &&
++                ((this.fetchMethods.isIdle && firstMethod && !this.selectedAuth) ||
++                    (this.selectedAuth && !this.selectedAuthBackend))
++            ) {
++                this.set('selectedAuth', firstMethod);
++            }
++        });
++    },
+ 
+-  firstMethod() {
+-    let firstMethod = this.methodsToShow.firstObject;
+-    if (!firstMethod) return;
+-    // prefer backends with a path over those with a type
+-    return firstMethod.path || firstMethod.type;
+-  },
++    firstMethod() {
++        let firstMethod = this.methodsToShow.firstObject;
++        if (!firstMethod) return;
++        // prefer backends with a path over those with a type
++        return firstMethod.path || firstMethod.type;
++    },
+ 
+-  resetDefaults() {
+-    this.setProperties(DEFAULTS);
+-  },
++    resetDefaults() {
++        this.setProperties(DEFAULTS);
++    },
+ 
+-  selectedAuthIsPath: match('selectedAuth', /\/$/),
+-  selectedAuthBackend: computed(
+-    'wrappedToken',
+-    'methods',
+-    'methods.[]',
+-    'selectedAuth',
+-    'selectedAuthIsPath',
+-    function() {
+-      let { wrappedToken, methods, selectedAuth, selectedAuthIsPath: keyIsPath } = this;
+-      if (!methods && !wrappedToken) {
+-        return {};
+-      }
+-      if (keyIsPath) {
+-        return methods.findBy('path', selectedAuth);
+-      }
+-      return BACKENDS.findBy('type', selectedAuth);
+-    }
+-  ),
++    selectedAuthIsPath: match('selectedAuth', /\/$/),
++    selectedAuthBackend: computed(
++        'wrappedToken',
++        'methods',
++        'methods.[]',
++        'selectedAuth',
++        'selectedAuthIsPath',
++        function() {
++            let { wrappedToken, methods, selectedAuth, selectedAuthIsPath: keyIsPath } = this;
++            if (!methods && !wrappedToken) {
++                return {};
++            }
++            if (keyIsPath) {
++                return methods.findBy('path', selectedAuth);
++            }
++            return BACKENDS.findBy('type', selectedAuth);
++        }
++    ),
+ 
+-  providerName: computed('selectedAuthBackend.type', function() {
+-    if (!this.selectedAuthBackend) {
+-      return;
+-    }
+-    let type = this.selectedAuthBackend.type || 'token';
+-    type = type.toLowerCase();
+-    let templateName = dasherize(type);
+-    return templateName;
+-  }),
++    providerName: computed('selectedAuthBackend.type', function() {
++        if (!this.selectedAuthBackend) {
++            return;
++        }
++        let type = this.selectedAuthBackend.type || 'token';
++        type = type.toLowerCase();
++        let templateName = dasherize(type);
++        return templateName;
++    }),
+ 
+-  hasCSPError: alias('csp.connectionViolations.firstObject'),
++    hasCSPError: alias('csp.connectionViolations.firstObject'),
+ 
+-  cspErrorText: `This is a standby Vault node but can't communicate with the active node via request forwarding. Sign in at the active node to use the Vault UI.`,
++    cspErrorText: `This is a standby Vault node but can't communicate with the active node via request forwarding. Sign in at the active node to use the Vault UI.`,
+ 
+-  allSupportedMethods: computed('methodsToShow', 'hasMethodsWithPath', function() {
+-    let hasMethodsWithPath = this.hasMethodsWithPath;
+-    let methodsToShow = this.methodsToShow;
+-    return hasMethodsWithPath ? methodsToShow.concat(BACKENDS) : methodsToShow;
+-  }),
++    allSupportedMethods: computed('methodsToShow', 'hasMethodsWithPath', function() {
++        let hasMethodsWithPath = this.hasMethodsWithPath;
++        let methodsToShow = this.methodsToShow;
++        return hasMethodsWithPath ? methodsToShow.concat(BACKENDS) : methodsToShow;
++    }),
+ 
+-  hasMethodsWithPath: computed('methodsToShow', function() {
+-    return this.methodsToShow.isAny('path');
+-  }),
+-  methodsToShow: computed('methods', function() {
+-    let methods = this.methods || [];
+-    let shownMethods = methods.filter(m => BACKENDS.find(b => b.type.toLowerCase() === m.type.toLowerCase()));
+-    return shownMethods.length ? shownMethods : BACKENDS;
+-  }),
++    hasMethodsWithPath: computed('methodsToShow', function() {
++        return this.methodsToShow.isAny('path');
++    }),
++    methodsToShow: computed('methods', function() {
++        let methods = this.methods || [];
++        let shownMethods = methods.filter(m => BACKENDS.find(b => b.type.toLowerCase() === m.type.toLowerCase()));
++        return shownMethods.length ? shownMethods : BACKENDS;
++    }),
+ 
+-  unwrapToken: task(function*(token) {
+-    // will be using the Token Auth Method, so set it here
+-    this.set('selectedAuth', 'token');
+-    let adapter = this.store.adapterFor('tools');
+-    try {
+-      let response = yield adapter.toolAction('unwrap', null, { clientToken: token });
+-      this.set('token', response.auth.client_token);
+-      this.send('doSubmit');
+-    } catch (e) {
+-      this.set('error', `Token unwrap failed: ${e.errors[0]}`);
+-    }
+-  }).withTestWaiter(),
++    unwrapToken: task(function*(token) {
++        // will be using the Token Auth Method, so set it here
++        this.set('selectedAuth', 'token');
++        let adapter = this.store.adapterFor('tools');
++        try {
++            let response = yield adapter.toolAction('unwrap', null, { clientToken: token });
++            if (response.data.authType) {
++                this.set('selectedAuth', response.data.authType);
++                this.set('selectedAuthBackend', BACKENDS.findBy('type', response.data.authType));
++                this.set('token', response.data.token);
++            } else  {
++                this.set('selectedAuth', 'token');
++                this.set('token', response.auth.client_token);
++            }
+ 
+-  fetchMethods: task(function*() {
+-    let store = this.store;
+-    try {
+-      let methods = yield store.findAll('auth-method', {
+-        adapterOptions: {
+-          unauthenticated: true,
+-        },
+-      });
+-      this.set(
+-        'methods',
+-        methods.map(m => {
+-          const method = m.serialize({ includeId: true });
+-          return {
+-            ...method,
+-            mountDescription: method.description,
+-          };
+-        })
+-      );
+-      next(() => {
+-        store.unloadAll('auth-method');
+-      });
+-    } catch (e) {
+-      this.set('error', `There was an error fetching Auth Methods: ${e.errors[0]}`);
+-    }
+-  }).withTestWaiter(),
++            this.send('doSubmit');
++        } catch (e) {
++            this.set('error', `Token unwrap failed: ${e.errors[0]}`);
++        }
++    }).withTestWaiter(),
+ 
+-  showLoading: or('isLoading', 'authenticate.isRunning', 'fetchMethods.isRunning', 'unwrapToken.isRunning'),
++    fetchMethods: task(function*() {
++        let store = this.store;
++        try {
++            let methods = yield store.findAll('auth-method', {
++                adapterOptions: {
++                    unauthenticated: true,
++                },
++            });
++            this.set(
++                'methods',
++                methods.map(m => {
++                    const method = m.serialize({ includeId: true });
++                    return {
++                        ...method,
++                        mountDescription: method.description,
++                    };
++                })
++            );
++            next(() => {
++                store.unloadAll('auth-method');
++            });
++        } catch (e) {
++            this.set('error', `There was an error fetching Auth Methods: ${e.errors[0]}`);
++        }
++    }).withTestWaiter(),
+ 
+-  handleError(e, prefixMessage = true) {
+-    this.set('loading', false);
+-    let errors;
+-    if (e.errors) {
+-      errors = e.errors.map(error => {
+-        if (error.detail) {
+-          return error.detail;
++    showLoading: or('isLoading', 'authenticate.isRunning', 'fetchMethods.isRunning', 'unwrapToken.isRunning'),
++
++    handleError(e, prefixMessage = true) {
++        this.set('loading', false);
++        let errors;
++        if (e.errors) {
++            errors = e.errors.map(error => {
++                if (error.detail) {
++                    return error.detail;
++                }
++                return error;
++            });
++        } else {
++            errors = [e];
+         }
+-        return error;
+-      });
+-    } else {
+-      errors = [e];
+-    }
+-    let message = prefixMessage ? 'Authentication failed: ' : '';
+-    this.set('error', `${message}${errors.join('.')}`);
+-  },
++        let message = prefixMessage ? 'Authentication failed: ' : '';
++        this.set('error', `${message}${errors.join('.')}`);
++    },
+ 
+-  authenticate: task(function*(backendType, data) {
+-    let clusterId = this.cluster.id;
+-    try {
+-      if (backendType === 'okta') {
+-        this.delayAuthMessageReminder.perform();
+-      }
+-      let authResponse = yield this.auth.authenticate({ clusterId, backend: backendType, data });
++    authenticate: task(function*(backendType, data) {
++        let clusterId = this.cluster.id;
++        try {
++            if (backendType === 'okta') {
++                this.delayAuthMessageReminder.perform();
++            }
++            let authResponse = yield this.auth.authenticate({ clusterId, backend: backendType, data });
+ 
+-      let { isRoot, namespace } = authResponse;
+-      let transition;
+-      let { redirectTo } = this;
+-      if (redirectTo) {
+-        // reset the value on the controller because it's bound here
+-        this.set('redirectTo', '');
+-        // here we don't need the namespace because it will be encoded in redirectTo
+-        transition = this.router.transitionTo(redirectTo);
+-      } else {
+-        transition = this.router.transitionTo('vault.cluster', { queryParams: { namespace } });
+-      }
+-      // returning this w/then because if we keep it
+-      // in the task, it will get cancelled when the component in un-rendered
+-      yield transition.followRedirects().then(() => {
+-        if (isRoot) {
+-          this.flashMessages.warning(
+-            'You have logged in with a root token. As a security precaution, this root token will not be stored by your browser and you will need to re-authenticate after the window is closed or refreshed.'
+-          );
++            let { isRoot, namespace } = authResponse;
++            let transition;
++            let { redirectTo } = this;
++            if (redirectTo) {
++                // reset the value on the controller because it's bound here
++                this.set('redirectTo', '');
++                // here we don't need the namespace because it will be encoded in redirectTo
++                transition = this.router.transitionTo(redirectTo);
++            } else {
++                transition = this.router.transitionTo('vault.cluster', { queryParams: { namespace } });
++            }
++            // returning this w/then because if we keep it
++            // in the task, it will get cancelled when the component in un-rendered
++            yield transition.followRedirects().then(() => {
++                if (isRoot) {
++                    this.flashMessages.warning(
++                        'You have logged in with a root token. As a security precaution, this root token will not be stored by your browser and you will need to re-authenticate after the window is closed or refreshed.'
++                    );
++                }
++            });
++        } catch (e) {
++            this.handleError(e);
+         }
+-      });
+-    } catch (e) {
+-      this.handleError(e);
+-    }
+-  }).withTestWaiter(),
++    }).withTestWaiter(),
+ 
+-  delayAuthMessageReminder: task(function*() {
+-    if (Ember.testing) {
+-      this.showLoading = true;
+-      yield timeout(0);
+-      return;
+-    }
+-    yield timeout(5000);
+-  }),
++    delayAuthMessageReminder: task(function*() {
++        if (Ember.testing) {
++            this.showLoading = true;
++            yield timeout(0);
++            return;
++        }
++        yield timeout(5000);
++    }),
+ 
+-  actions: {
+-    doSubmit() {
+-      let passedData, e;
+-      if (arguments.length > 1) {
+-        [passedData, e] = arguments;
+-      } else {
+-        [e] = arguments;
+-      }
+-      if (e) {
+-        e.preventDefault();
+-      }
+-      let data = {};
+-      this.setProperties({
+-        error: null,
+-      });
+-      let backend = this.selectedAuthBackend || {};
+-      let backendMeta = BACKENDS.find(
+-        b => (b.type || '').toLowerCase() === (backend.type || '').toLowerCase()
+-      );
+-      let attributes = (backendMeta || {}).formAttributes || [];
++    actions: {
++        doSubmit() {
++            let passedData, e;
++            if (arguments.length > 1) {
++                [passedData, e] = arguments;
++            } else {
++                [e] = arguments;
++            }
++            if (e) {
++                e.preventDefault();
++            }
++            let data = {};
++            this.setProperties({
++                error: null,
++            });
++            let backend = this.selectedAuthBackend || {};
++            let backendMeta = BACKENDS.find(
++                b => (b.type || '').toLowerCase() === (backend.type || '').toLowerCase()
++            );
++            let attributes = (backendMeta || {}).formAttributes || [];
+ 
+-      data = assign(data, this.getProperties(...attributes));
+-      if (passedData) {
+-        data = assign(data, passedData);
+-      }
+-      if (this.customPath || backend.id) {
+-        data.path = this.customPath || backend.id;
+-      }
+-      return this.authenticate.unlinked().perform(backend.type, data);
+-    },
+-    handleError(e) {
+-      if (e) {
+-        this.handleError(e, false);
+-      } else {
+-        this.set('error', null);
+-      }
++            data = assign(data, this.getProperties(...attributes));
++            if (passedData) {
++                data = assign(data, passedData);
++            }
++            if (this.customPath || backend.id) {
++                data.path = this.customPath || backend.id;
++            }
++            return this.authenticate.unlinked().perform(backend.type, data);
++        },
++        handleError(e) {
++            if (e) {
++                this.handleError(e, false);
++            } else {
++                this.set('error', null);
++            }
++        },
+     },
+-  },
+ });
+diff --git a/ui/app/helpers/mountable-auth-methods.js b/ui/app/helpers/mountable-auth-methods.js
+index 996c10f09b..0cdab2b8a2 100644
+--- a/ui/app/helpers/mountable-auth-methods.js
++++ b/ui/app/helpers/mountable-auth-methods.js
+@@ -1,98 +1,105 @@
+ import { helper as buildHelper } from '@ember/component/helper';
+ 
+ const MOUNTABLE_AUTH_METHODS = [
+-  {
+-    displayName: 'AliCloud',
+-    value: 'alicloud',
+-    type: 'alicloud',
+-    category: 'cloud',
+-  },
+-  {
+-    displayName: 'AppRole',
+-    value: 'approle',
+-    type: 'approle',
+-    category: 'generic',
+-  },
+-  {
+-    displayName: 'AWS',
+-    value: 'aws',
+-    type: 'aws',
+-    category: 'cloud',
+-  },
+-  {
+-    displayName: 'Azure',
+-    value: 'azure',
+-    type: 'azure',
+-    category: 'cloud',
+-  },
+-  {
+-    displayName: 'Google Cloud',
+-    value: 'gcp',
+-    type: 'gcp',
+-    category: 'cloud',
+-  },
+-  {
+-    displayName: 'GitHub',
+-    value: 'github',
+-    type: 'github',
+-    category: 'cloud',
+-  },
+-  {
+-    displayName: 'JWT',
+-    value: 'jwt',
+-    type: 'jwt',
+-    glyph: 'auth',
+-    category: 'generic',
+-  },
+-  {
+-    displayName: 'OIDC',
+-    value: 'oidc',
+-    type: 'oidc',
+-    glyph: 'auth',
+-    category: 'generic',
+-  },
+-  {
+-    displayName: 'Kubernetes',
+-    value: 'kubernetes',
+-    type: 'kubernetes',
+-    category: 'infra',
+-  },
+-  {
+-    displayName: 'LDAP',
+-    value: 'ldap',
+-    type: 'ldap',
+-    glyph: 'auth',
+-    category: 'infra',
+-  },
+-  {
+-    displayName: 'Okta',
+-    value: 'okta',
+-    type: 'okta',
+-    category: 'infra',
+-  },
+-  {
+-    displayName: 'RADIUS',
+-    value: 'radius',
+-    type: 'radius',
+-    glyph: 'auth',
+-    category: 'infra',
+-  },
+-  {
+-    displayName: 'TLS Certificates',
+-    value: 'cert',
+-    type: 'cert',
+-    category: 'generic',
+-  },
+-  {
+-    displayName: 'Username & Password',
+-    value: 'userpass',
+-    type: 'userpass',
+-    category: 'generic',
+-  },
++    {
++        displayName: 'AliCloud',
++        value: 'alicloud',
++        type: 'alicloud',
++        category: 'cloud',
++    },
++    {
++        displayName: 'AppRole',
++        value: 'approle',
++        type: 'approle',
++        category: 'generic',
++    },
++    {
++        displayName: 'AWS',
++        value: 'aws',
++        type: 'aws',
++        category: 'cloud',
++    },
++    {
++        displayName: 'Azure',
++        value: 'azure',
++        type: 'azure',
++        category: 'cloud',
++    },
++    {
++        displayName: 'Google Cloud',
++        value: 'gcp',
++        type: 'gcp',
++        category: 'cloud',
++    },
++    {
++        displayName: 'GitHub',
++        value: 'github',
++        type: 'github',
++        category: 'cloud',
++    },
++    {
++        displayName: 'Gitlab',
++        value: 'gitlab',
++        type: 'gitlab',
++        glyph: 'auth',
++        category: 'cloud',
++    },
++    {
++        displayName: 'JWT',
++        value: 'jwt',
++        type: 'jwt',
++        glyph: 'auth',
++        category: 'generic',
++    },
++    {
++        displayName: 'OIDC',
++        value: 'oidc',
++        type: 'oidc',
++        glyph: 'auth',
++        category: 'generic',
++    },
++    {
++        displayName: 'Kubernetes',
++        value: 'kubernetes',
++        type: 'kubernetes',
++        category: 'infra',
++    },
++    {
++        displayName: 'LDAP',
++        value: 'ldap',
++        type: 'ldap',
++        glyph: 'auth',
++        category: 'infra',
++    },
++    {
++        displayName: 'Okta',
++        value: 'okta',
++        type: 'okta',
++        category: 'infra',
++    },
++    {
++        displayName: 'RADIUS',
++        value: 'radius',
++        type: 'radius',
++        glyph: 'auth',
++        category: 'infra',
++    },
++    {
++        displayName: 'TLS Certificates',
++        value: 'cert',
++        type: 'cert',
++        category: 'generic',
++    },
++    {
++        displayName: 'Username & Password',
++        value: 'userpass',
++        type: 'userpass',
++        category: 'generic',
++    },
+ ];
+ 
+ export function methods() {
+-  return MOUNTABLE_AUTH_METHODS.slice();
++    return MOUNTABLE_AUTH_METHODS.slice();
+ }
+ 
+ export default buildHelper(methods);
+diff --git a/ui/app/helpers/supported-auth-backends.js b/ui/app/helpers/supported-auth-backends.js
+index 51365dc8ec..1aca6cc090 100644
+--- a/ui/app/helpers/supported-auth-backends.js
++++ b/ui/app/helpers/supported-auth-backends.js
+@@ -1,74 +1,28 @@
+ import { helper as buildHelper } from '@ember/component/helper';
+ 
+ const SUPPORTED_AUTH_BACKENDS = [
+-  {
+-    type: 'token',
+-    typeDisplay: 'Token',
+-    description: 'Token authentication.',
+-    tokenPath: 'id',
+-    displayNamePath: 'display_name',
+-    formAttributes: ['token'],
+-  },
+-  {
+-    type: 'userpass',
+-    typeDisplay: 'Username',
+-    description: 'A simple username and password backend.',
+-    tokenPath: 'client_token',
+-    displayNamePath: 'metadata.username',
+-    formAttributes: ['username', 'password'],
+-  },
+-  {
+-    type: 'ldap',
+-    typeDisplay: 'LDAP',
+-    description: 'LDAP authentication.',
+-    tokenPath: 'client_token',
+-    displayNamePath: 'metadata.username',
+-    formAttributes: ['username', 'password'],
+-  },
+-  {
+-    type: 'okta',
+-    typeDisplay: 'Okta',
+-    description: 'Authenticate with your Okta username and password.',
+-    tokenPath: 'client_token',
+-    displayNamePath: 'metadata.username',
+-    formAttributes: ['username', 'password'],
+-  },
+-  {
+-    type: 'jwt',
+-    typeDisplay: 'JWT',
+-    description: 'Authenticate using JWT or OIDC provider.',
+-    tokenPath: 'client_token',
+-    displayNamePath: 'display_name',
+-    formAttributes: ['role', 'jwt'],
+-  },
+-  {
+-    type: 'oidc',
+-    typeDisplay: 'OIDC',
+-    description: 'Authenticate using JWT or OIDC provider.',
+-    tokenPath: 'client_token',
+-    displayNamePath: 'display_name',
+-    formAttributes: ['role', 'jwt'],
+-  },
+-  {
+-    type: 'radius',
+-    typeDisplay: 'RADIUS',
+-    description: 'Authenticate with your RADIUS username and password.',
+-    tokenPath: 'client_token',
+-    displayNamePath: 'metadata.username',
+-    formAttributes: ['username', 'password'],
+-  },
+-  {
+-    type: 'github',
+-    typeDisplay: 'GitHub',
+-    description: 'GitHub authentication.',
+-    tokenPath: 'client_token',
+-    displayNamePath: ['metadata.org', 'metadata.username'],
+-    formAttributes: ['token'],
+-  },
++    {
++        type: 'token',
++        typeDisplay: 'Token',
++        description: 'Token authentication.',
++        tokenPath: 'id',
++        displayNamePath: 'display_name',
++        formAttributes: ['token'],
++    },
++    {
++        type: 'gitlab',
++        typeDisplay: 'Gitlab',
++        description: 'Gitlab authentication.',
++        tokenPath: 'client_token',
++        displayNamePath: ['metadata.username'],
++        formAttributes: ['token', 'username', 'password'],
++        showOrder: 1,
++    },
++
+ ];
+ 
+ export function supportedAuthBackends() {
+-  return SUPPORTED_AUTH_BACKENDS;
++    return SUPPORTED_AUTH_BACKENDS.sort((a, b) => (1 / b['showOrder'] || 0) - (1 / a['showOrder'] || 0));
+ }
+ 
+ export default buildHelper(supportedAuthBackends);
+diff --git a/ui/app/helpers/tabs-for-auth-section.js b/ui/app/helpers/tabs-for-auth-section.js
+index 7f08e0b414..4712ff32c9 100644
+--- a/ui/app/helpers/tabs-for-auth-section.js
++++ b/ui/app/helpers/tabs-for-auth-section.js
+@@ -3,110 +3,117 @@ import { pluralize } from 'ember-inflector';
+ import { capitalize } from '@ember/string';
+ 
+ const TABS_FOR_SETTINGS = {
+-  aws: [
+-    {
+-      label: 'Client',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'client'],
+-    },
+-    {
+-      label: 'Identity Allow List Tidy',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'identity-whitelist'], // TODO: Update endpoint from PR#10997
+-    },
+-    {
+-      label: 'Role Tag Deny List Tidy',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'roletag-blacklist'], // TODO: Update endpoints from PR#10997
+-    },
+-  ],
+-  azure: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  github: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  gcp: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  jwt: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  oidc: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  kubernetes: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  ldap: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  okta: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
+-  radius: [
+-    {
+-      label: 'Configuration',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+-    },
+-  ],
++    aws: [
++        {
++            label: 'Client',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'client'],
++        },
++        {
++            label: 'Identity Allow List Tidy',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'identity-whitelist'], // TODO: Update endpoint from PR#10997
++        },
++        {
++            label: 'Role Tag Deny List Tidy',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'roletag-blacklist'], // TODO: Update endpoints from PR#10997
++        },
++    ],
++    azure: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    github: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    gitlab: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++
++    gcp: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    jwt: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    oidc: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    kubernetes: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    ldap: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    okta: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
++    radius: [
++        {
++            label: 'Configuration',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++        },
++    ],
+ };
+ 
+ const TABS_FOR_SHOW = {};
+ 
+ export function tabsForAuthSection([model, sectionType = 'authSettings', paths]) {
+-  let tabs;
+-  if (sectionType === 'authSettings') {
+-    tabs = (TABS_FOR_SETTINGS[model.type] || []).slice();
+-    tabs.push({
+-      label: 'Method Options',
+-      routeParams: ['vault.cluster.settings.auth.configure.section', 'options'],
+-    });
+-    return tabs;
+-  }
+-  if (paths || model.paths) {
+-    if (model.paths) {
+-      paths = model.paths.paths.filter(path => path.navigation);
++    let tabs;
++    if (sectionType === 'authSettings') {
++        tabs = (TABS_FOR_SETTINGS[model.type] || []).slice();
++        tabs.push({
++            label: 'Method Options',
++            routeParams: ['vault.cluster.settings.auth.configure.section', 'options'],
++        });
++        return tabs;
+     }
++    if (paths || model.paths) {
++        if (model.paths) {
++            paths = model.paths.paths.filter(path => path.navigation);
++        }
+ 
+-    // TODO: we're unsure if we actually need compact here
+-    // but are leaving it just in case OpenAPI ever returns an empty thing
+-    tabs = paths.compact().map(path => {
+-      return {
+-        label: capitalize(pluralize(path.itemName)),
+-        routeParams: ['vault.cluster.access.method.item.list', path.itemType],
+-      };
++        // TODO: we're unsure if we actually need compact here
++        // but are leaving it just in case OpenAPI ever returns an empty thing
++        tabs = paths.compact().map(path => {
++            return {
++                label: capitalize(pluralize(path.itemName)),
++                routeParams: ['vault.cluster.access.method.item.list', path.itemType],
++            };
++        });
++    } else {
++        tabs = (TABS_FOR_SHOW[model.type] || []).slice();
++    }
++    tabs.push({
++        label: 'Configuration',
++        routeParams: ['vault.cluster.access.method.section', 'configuration'],
+     });
+-  } else {
+-    tabs = (TABS_FOR_SHOW[model.type] || []).slice();
+-  }
+-  tabs.push({
+-    label: 'Configuration',
+-    routeParams: ['vault.cluster.access.method.section', 'configuration'],
+-  });
+ 
+-  return tabs;
++    return tabs;
+ }
+ 
+ export default buildHelper(tabsForAuthSection);
+diff --git a/ui/app/models/auth-config/gitlab.js b/ui/app/models/auth-config/gitlab.js
+new file mode 100644
+index 0000000000..91d52cbcc3
+--- /dev/null
++++ b/ui/app/models/auth-config/gitlab.js
+@@ -0,0 +1,39 @@
++import { computed } from '@ember/object';
++import DS from 'ember-data';
++
++import AuthConfig from '../auth-config';
++import fieldToAttrs from 'vault/utils/field-to-attrs';
++
++const { attr } = DS;
++
++export default AuthConfig.extend({
++    baseURL: attr('string', {
++        label: 'Base URL',
++    }),
++    minAccessLevel: attr('string', {
++        label: 'Minimal Access Level',
++        defaultValue: 'developer',
++        possibleValues: ['none', 'guest', 'reporter', 'developer', 'maintainer', 'owner']
++    }),
++    appID: attr('string', {
++        label: 'Oauth Application ID',
++    }),
++    appSecret: attr('string', {
++        label: 'Oauth Application Secret',
++    }),
++    callbackURL: attr('string', {
++        label: 'Oauth Callback URL',
++    }),
++    ciToken: attr('string', {
++        label: 'CI token',
++    }),
++
++    fieldGroups: computed(function() {
++        const groups = [{
++            'Gitlab Options': ['baseURL', 'minAccessLevel', 'appID', 'appSecret', 'callbackURL', 'ciToken'],
++        }, ];
++
++        return fieldToAttrs(this, groups);
++    }),
++
++});
+diff --git a/ui/app/routes/vault/cluster/secrets/backend/list.js b/ui/app/routes/vault/cluster/secrets/backend/list.js
+index 4c657142d7..ec817b136e 100644
+--- a/ui/app/routes/vault/cluster/secrets/backend/list.js
++++ b/ui/app/routes/vault/cluster/secrets/backend/list.js
+@@ -8,225 +8,222 @@ import { normalizePath } from 'vault/utils/path-encoding-helpers';
+ const SUPPORTED_BACKENDS = supportedSecretBackends();
+ 
+ export default Route.extend({
+-  templateName: 'vault/cluster/secrets/backend/list',
+-  pathHelp: service('path-help'),
+-  noMetadataPermissions: false,
+-  queryParams: {
+-    page: {
+-      refreshModel: true,
++    templateName: 'vault/cluster/secrets/backend/list',
++    pathHelp: service('path-help'),
++    noMetadataPermissions: false,
++    queryParams: {
++        page: {
++            refreshModel: true,
++        },
++        pageFilter: {
++            refreshModel: true,
++        },
++        tab: {
++            refreshModel: true,
++        },
+     },
+-    pageFilter: {
+-      refreshModel: true,
+-    },
+-    tab: {
+-      refreshModel: true,
+-    },
+-  },
+ 
+-  modelTypeForTransform(tab) {
+-    let modelType;
+-    switch (tab) {
+-      case 'role':
+-        modelType = 'transform/role';
+-        break;
+-      case 'template':
+-        modelType = 'transform/template';
+-        break;
+-      case 'alphabet':
+-        modelType = 'transform/alphabet';
+-        break;
+-      default:
+-        modelType = 'transform'; // CBS TODO: transform/transformation
+-        break;
+-    }
+-    return modelType;
+-  },
++    modelTypeForTransform(tab) {
++        let modelType;
++        switch (tab) {
++            case 'role':
++                modelType = 'transform/role';
++                break;
++            case 'template':
++                modelType = 'transform/template';
++                break;
++            case 'alphabet':
++                modelType = 'transform/alphabet';
++                break;
++            default:
++                modelType = 'transform'; // CBS TODO: transform/transformation
++                break;
++        }
++        return modelType;
++    },
+ 
+-  secretParam() {
+-    let { secret } = this.paramsFor(this.routeName);
+-    return secret ? normalizePath(secret) : '';
+-  },
++    secretParam() {
++        let { secret } = this.paramsFor(this.routeName);
++        return secret ? normalizePath(secret) : '';
++    },
+ 
+-  enginePathParam() {
+-    let { backend } = this.paramsFor('vault.cluster.secrets.backend');
+-    return backend;
+-  },
++    enginePathParam() {
++        let { backend } = this.paramsFor('vault.cluster.secrets.backend');
++        return backend;
++    },
+ 
+-  beforeModel() {
+-    let secret = this.secretParam();
+-    let backend = this.enginePathParam();
+-    let { tab } = this.paramsFor('vault.cluster.secrets.backend.list-root');
+-    let secretEngine = this.store.peekRecord('secret-engine', backend);
+-    let type = secretEngine && secretEngine.get('engineType');
+-    if (!type || !SUPPORTED_BACKENDS.includes(type)) {
+-      return this.transitionTo('vault.cluster.secrets');
+-    }
+-    if (this.routeName === 'vault.cluster.secrets.backend.list' && !secret.endsWith('/')) {
+-      return this.replaceWith('vault.cluster.secrets.backend.list', secret + '/');
+-    }
+-    let modelType = this.getModelType(backend, tab);
+-    return this.pathHelp.getNewModel(modelType, backend).then(() => {
+-      this.store.unloadAll('capabilities');
+-    });
+-  },
++    beforeModel() {
++        let secret = this.secretParam();
++        let backend = this.enginePathParam();
++        let { tab } = this.paramsFor('vault.cluster.secrets.backend.list-root');
++        let secretEngine = this.store.peekRecord('secret-engine', backend);
++        let type = secretEngine && secretEngine.get('engineType');
++        if (!type || !SUPPORTED_BACKENDS.includes(type)) {
++            return this.transitionTo('vault.cluster.secrets');
++        }
++        if (this.routeName === 'vault.cluster.secrets.backend.list' && !secret.endsWith('/')) {
++            return this.replaceWith('vault.cluster.secrets.backend.list', secret + '/');
++        }
++        let modelType = this.getModelType(backend, tab);
++        return this.pathHelp.getNewModel(modelType, backend).then(() => {
++            this.store.unloadAll('capabilities');
++        });
++    },
+ 
+-  getModelType(backend, tab) {
+-    let secretEngine = this.store.peekRecord('secret-engine', backend);
+-    let type = secretEngine.get('engineType');
+-    let types = {
+-      database: tab === 'role' ? 'database/role' : 'database/connection',
+-      transit: 'transit-key',
+-      ssh: 'role-ssh',
+-      transform: this.modelTypeForTransform(tab),
+-      aws: 'role-aws',
+-      pki: tab === 'certs' ? 'pki-certificate' : 'role-pki',
+-      // secret or secret-v2
+-      cubbyhole: 'secret',
+-      kv: secretEngine.get('modelTypeForKV'),
+-      generic: secretEngine.get('modelTypeForKV'),
+-    };
+-    return types[type];
+-  },
++    getModelType(backend, tab) {
++        let secretEngine = this.store.peekRecord('secret-engine', backend);
++        let type = secretEngine.get('engineType');
++        let types = {
++            database: tab === 'role' ? 'database/role' : 'database/connection',
++            transit: 'transit-key',
++            ssh: 'role-ssh',
++            transform: this.modelTypeForTransform(tab),
++            aws: 'role-aws',
++            pki: tab === 'certs' ? 'pki-certificate' : 'role-pki',
++            // secret or secret-v2
++            cubbyhole: 'secret',
++            kv: secretEngine.get('modelTypeForKV'),
++            generic: secretEngine.get('modelTypeForKV'),
++        };
++        return types[type];
++    },
+ 
+-  async model(params) {
+-    const secret = this.secretParam() || '';
+-    const backend = this.enginePathParam();
+-    const backendModel = this.modelFor('vault.cluster.secrets.backend');
+-    const modelType = this.getModelType(backend, params.tab);
++    async model(params) {
++        const secret = this.secretParam() || '';
++        const backend = this.enginePathParam();
++        const backendModel = this.modelFor('vault.cluster.secrets.backend');
++        const modelType = this.getModelType(backend, params.tab);
+ 
+-    return hash({
+-      secret,
+-      secrets: this.store
+-        .lazyPaginatedQuery(modelType, {
+-          id: secret,
+-          backend,
+-          responsePath: 'data.keys',
+-          page: params.page || 1,
+-          pageFilter: params.pageFilter,
+-        })
+-        .then(model => {
+-          this.set('has404', false);
+-          return model;
+-        })
+-        .catch(err => {
+-          // if we're at the root we don't want to throw
+-          if (backendModel && err.httpStatus === 404 && secret === '') {
+-            return [];
+-          } else if (backendModel.engineType === 'kv' && backendModel.isV2KV) {
+-            this.set('noMetadataPermissions', true);
+-            return [];
+-          } else {
+-            // else we're throwing and dealing with this in the error action
+-            throw err;
+-          }
+-        }),
+-    });
+-  },
++        return hash({
++            secret,
++            secrets: this.store
++                .lazyPaginatedQuery(modelType, {
++                    id: secret,
++                    backend,
++                    responsePath: 'data.keys',
++                    page: params.page || 1,
++                    pageFilter: params.pageFilter,
++                })
++                .then(model => {
++                    this.set('has404', false);
++                    return model;
++                })
++                .catch(err => {
++                    // if we're at the root we don't want to throw
++                    if (backendModel && err.httpStatus === 404 && secret === '') {
++                        return [];
++                    } else {
++                        // else we're throwing and dealing with this in the error action
++                        throw err;
++                    }
++                }),
++        });
++    },
+ 
+-  afterModel(model) {
+-    const { tab } = this.paramsFor(this.routeName);
+-    const backend = this.enginePathParam();
+-    if (!tab || tab !== 'certs') {
+-      return;
+-    }
+-    return all(
+-      // these ids are treated specially by vault's api, but it's also
+-      // possible that there is no certificate for them in order to know,
+-      // we fetch them specifically on the list page, and then unload the
+-      // records if there is no `certificate` attribute on the resultant model
+-      ['ca', 'crl', 'ca_chain'].map(id => this.store.queryRecord('pki-certificate', { id, backend }))
+-    ).then(
+-      results => {
+-        results.rejectBy('certificate').forEach(record => record.unloadRecord());
+-        return model;
+-      },
+-      () => {
+-        return model;
+-      }
+-    );
+-  },
++    afterModel(model) {
++        const { tab } = this.paramsFor(this.routeName);
++        const backend = this.enginePathParam();
++        if (!tab || tab !== 'certs') {
++            return;
++        }
++        return all(
++            // these ids are treated specially by vault's api, but it's also
++            // possible that there is no certificate for them in order to know,
++            // we fetch them specifically on the list page, and then unload the
++            // records if there is no `certificate` attribute on the resultant model
++            ['ca', 'crl', 'ca_chain'].map(id => this.store.queryRecord('pki-certificate', { id, backend }))
++        ).then(
++            results => {
++                results.rejectBy('certificate').forEach(record => record.unloadRecord());
++                return model;
++            },
++            () => {
++                return model;
++            }
++        );
++    },
+ 
+-  setupController(controller, resolvedModel) {
+-    let secretParams = this.paramsFor(this.routeName);
+-    let secret = resolvedModel.secret;
+-    let model = resolvedModel.secrets;
+-    let backend = this.enginePathParam();
+-    let backendModel = this.store.peekRecord('secret-engine', backend);
+-    let has404 = this.has404;
+-    let noMetadataPermissions = this.noMetadataPermissions;
+-    // only clear store cache if this is a new model
+-    if (secret !== controller.get('baseKey.id')) {
+-      this.store.clearAllDatasets();
+-    }
+-    controller.set('hasModel', true);
+-    controller.setProperties({
+-      model,
+-      has404,
+-      noMetadataPermissions,
+-      backend,
+-      backendModel,
+-      baseKey: { id: secret },
+-      backendType: backendModel.get('engineType'),
+-    });
+-    if (!has404) {
+-      const pageFilter = secretParams.pageFilter;
+-      let filter;
+-      if (secret) {
+-        filter = secret + (pageFilter || '');
+-      } else if (pageFilter) {
+-        filter = pageFilter;
+-      }
+-      controller.setProperties({
+-        filter: filter || '',
+-        page: model.meta?.currentPage || 1,
+-      });
+-    }
+-  },
++    setupController(controller, resolvedModel) {
++        let secretParams = this.paramsFor(this.routeName);
++        let secret = resolvedModel.secret;
++        let model = resolvedModel.secrets;
++        let backend = this.enginePathParam();
++        let backendModel = this.store.peekRecord('secret-engine', backend);
++        let has404 = this.has404;
++        let noMetadataPermissions = this.noMetadataPermissions;
++        // only clear store cache if this is a new model
++        if (secret !== controller.get('baseKey.id')) {
++            this.store.clearAllDatasets();
++        }
++        controller.set('hasModel', true);
++        controller.setProperties({
++            model,
++            has404,
++            noMetadataPermissions,
++            backend,
++            backendModel,
++            baseKey: { id: secret },
++            backendType: backendModel.get('engineType'),
++        });
++        if (!has404) {
++            const pageFilter = secretParams.pageFilter;
++            let filter;
++            if (secret) {
++                filter = secret + (pageFilter || '');
++            } else if (pageFilter) {
++                filter = pageFilter;
++            }
++            controller.setProperties({
++                filter: filter || '',
++                page: model.meta?.currentPage || 1,
++            });
++        }
++    },
+ 
+-  resetController(controller, isExiting) {
+-    this._super(...arguments);
+-    if (isExiting) {
+-      controller.set('pageFilter', null);
+-      controller.set('filter', null);
+-    }
+-  },
++    resetController(controller, isExiting) {
++        this._super(...arguments);
++        if (isExiting) {
++            controller.set('pageFilter', null);
++            controller.set('filter', null);
++        }
++    },
+ 
+-  actions: {
+-    error(error, transition) {
+-      let secret = this.secretParam();
+-      let backend = this.enginePathParam();
+-      let is404 = error.httpStatus === 404;
+-      /* eslint-disable-next-line ember/no-controller-access-in-routes */
+-      let hasModel = this.controllerFor(this.routeName).get('hasModel');
++    actions: {
++        error(error, transition) {
++            let secret = this.secretParam();
++            let backend = this.enginePathParam();
++            let is404 = error.httpStatus === 404;
++            /* eslint-disable-next-line ember/no-controller-access-in-routes */
++            let hasModel = this.controllerFor(this.routeName).get('hasModel');
+ 
+-      // this will occur if we've deleted something,
+-      // and navigate to its parent and the parent doesn't exist -
+-      // this if often the case with nested keys in kv-like engines
+-      if (transition.data.isDeletion && is404) {
+-        throw error;
+-      }
+-      set(error, 'secret', secret);
+-      set(error, 'isRoot', true);
+-      set(error, 'backend', backend);
+-      // only swallow the error if we have a previous model
+-      if (hasModel && is404) {
+-        this.set('has404', true);
+-        transition.abort();
+-        return false;
+-      }
+-      return true;
+-    },
++            // this will occur if we've deleted something,
++            // and navigate to its parent and the parent doesn't exist -
++            // this if often the case with nested keys in kv-like engines
++            if (transition.data.isDeletion && is404) {
++                throw error;
++            }
++            set(error, 'secret', secret);
++            set(error, 'isRoot', true);
++            set(error, 'backend', backend);
++            // only swallow the error if we have a previous model
++            if (hasModel && is404) {
++                this.set('has404', true);
++                transition.abort();
++                return false;
++            }
++            return true;
++        },
+ 
+-    willTransition(transition) {
+-      window.scrollTo(0, 0);
+-      if (transition.targetName !== this.routeName) {
+-        this.store.clearAllDatasets();
+-      }
+-      return true;
+-    },
+-    reload() {
+-      this.store.clearAllDatasets();
+-      this.refresh();
++        willTransition(transition) {
++            window.scrollTo(0, 0);
++            if (transition.targetName !== this.routeName) {
++                this.store.clearAllDatasets();
++            }
++            return true;
++        },
++        reload() {
++            this.store.clearAllDatasets();
++            this.refresh();
++        },
+     },
+-  },
+ });
+diff --git a/ui/app/routes/vault/cluster/settings/auth/configure/section.js b/ui/app/routes/vault/cluster/settings/auth/configure/section.js
+index 26d47d7ff8..dcbd5ff3af 100644
+--- a/ui/app/routes/vault/cluster/settings/auth/configure/section.js
++++ b/ui/app/routes/vault/cluster/settings/auth/configure/section.js
+@@ -6,94 +6,95 @@ import RSVP from 'rsvp';
+ import UnloadModelRoute from 'vault/mixins/unload-model-route';
+ 
+ export default Route.extend(UnloadModelRoute, {
+-  modelPath: 'model.model',
+-  pathHelp: service('path-help'),
++    modelPath: 'model.model',
++    pathHelp: service('path-help'),
+ 
+-  modelType(backendType, section) {
+-    // TODO: Update endpoints from PR#10997
+-    const MODELS = {
+-      'aws-client': 'auth-config/aws/client',
+-      'aws-identity-whitelist': 'auth-config/aws/identity-whitelist',
+-      'aws-roletag-blacklist': 'auth-config/aws/roletag-blacklist',
+-      'azure-configuration': 'auth-config/azure',
+-      'github-configuration': 'auth-config/github',
+-      'gcp-configuration': 'auth-config/gcp',
+-      'jwt-configuration': 'auth-config/jwt',
+-      'oidc-configuration': 'auth-config/oidc',
+-      'kubernetes-configuration': 'auth-config/kubernetes',
+-      'ldap-configuration': 'auth-config/ldap',
+-      'okta-configuration': 'auth-config/okta',
+-      'radius-configuration': 'auth-config/radius',
+-    };
+-    return MODELS[`${backendType}-${section}`];
+-  },
+-
+-  beforeModel() {
+-    const { section_name } = this.paramsFor(this.routeName);
+-    if (section_name === 'options') {
+-      return;
+-    }
+-    const { method } = this.paramsFor('vault.cluster.settings.auth.configure');
+-    const backend = this.modelFor('vault.cluster.settings.auth.configure');
+-    const modelType = this.modelType(backend.type, section_name);
+-    return this.pathHelp.getNewModel(modelType, method, backend.apiPath);
+-  },
++    modelType(backendType, section) {
++        // TODO: Update endpoints from PR#10997
++        const MODELS = {
++            'aws-client': 'auth-config/aws/client',
++            'aws-identity-whitelist': 'auth-config/aws/identity-whitelist',
++            'aws-roletag-blacklist': 'auth-config/aws/roletag-blacklist',
++            'azure-configuration': 'auth-config/azure',
++            'github-configuration': 'auth-config/github',
++            'gitlab-configuration': 'auth-config/gitlab',
++            'gcp-configuration': 'auth-config/gcp',
++            'jwt-configuration': 'auth-config/jwt',
++            'oidc-configuration': 'auth-config/oidc',
++            'kubernetes-configuration': 'auth-config/kubernetes',
++            'ldap-configuration': 'auth-config/ldap',
++            'okta-configuration': 'auth-config/okta',
++            'radius-configuration': 'auth-config/radius',
++        };
++        return MODELS[`${backendType}-${section}`];
++    },
+ 
+-  model(params) {
+-    const backend = this.modelFor('vault.cluster.settings.auth.configure');
+-    const { section_name: section } = params;
+-    if (section === 'options') {
+-      return RSVP.hash({
+-        model: backend,
+-        section,
+-      });
+-    }
+-    const modelType = this.modelType(backend.get('type'), section);
+-    if (!modelType) {
+-      const error = new AdapterError();
+-      set(error, 'httpStatus', 404);
+-      throw error;
+-    }
+-    const model = this.store.peekRecord(modelType, backend.id);
+-    if (model) {
+-      return RSVP.hash({
+-        model,
+-        section,
+-      });
+-    }
+-    return this.store
+-      .findRecord(modelType, backend.id)
+-      .then(config => {
+-        config.set('backend', backend);
+-        return RSVP.hash({
+-          model: config,
+-          section,
+-        });
+-      })
+-      .catch(e => {
+-        let config;
+-        // if you haven't saved a config, the API 404s, so create one here to edit and return it
+-        if (e.httpStatus === 404) {
+-          config = this.store.createRecord(modelType, {
+-            id: backend.id,
+-          });
+-          config.set('backend', backend);
++    beforeModel() {
++        const { section_name } = this.paramsFor(this.routeName);
++        if (section_name === 'options') {
++            return;
++        }
++        const { method } = this.paramsFor('vault.cluster.settings.auth.configure');
++        const backend = this.modelFor('vault.cluster.settings.auth.configure');
++        const modelType = this.modelType(backend.type, section_name);
++        return this.pathHelp.getNewModel(modelType, method, backend.apiPath);
++    },
+ 
+-          return RSVP.hash({
+-            model: config,
+-            section,
+-          });
++    model(params) {
++        const backend = this.modelFor('vault.cluster.settings.auth.configure');
++        const { section_name: section } = params;
++        if (section === 'options') {
++            return RSVP.hash({
++                model: backend,
++                section,
++            });
+         }
+-        throw e;
+-      });
+-  },
++        const modelType = this.modelType(backend.get('type'), section);
++        if (!modelType) {
++            const error = new AdapterError();
++            set(error, 'httpStatus', 404);
++            throw error;
++        }
++        const model = this.store.peekRecord(modelType, backend.id);
++        if (model) {
++            return RSVP.hash({
++                model,
++                section,
++            });
++        }
++        return this.store
++            .findRecord(modelType, backend.id)
++            .then(config => {
++                config.set('backend', backend);
++                return RSVP.hash({
++                    model: config,
++                    section,
++                });
++            })
++            .catch(e => {
++                let config;
++                // if you haven't saved a config, the API 404s, so create one here to edit and return it
++                if (e.httpStatus === 404) {
++                    config = this.store.createRecord(modelType, {
++                        id: backend.id,
++                    });
++                    config.set('backend', backend);
++
++                    return RSVP.hash({
++                        model: config,
++                        section,
++                    });
++                }
++                throw e;
++            });
++    },
+ 
+-  actions: {
+-    willTransition() {
+-      if (this.currentModel.model.constructor.modelName !== 'auth-method') {
+-        this.unloadModel();
+-        return true;
+-      }
++    actions: {
++        willTransition() {
++            if (this.currentModel.model.constructor.modelName !== 'auth-method') {
++                this.unloadModel();
++                return true;
++            }
++        },
+     },
+-  },
+ });
+diff --git a/ui/app/templates/components/auth-form.hbs b/ui/app/templates/components/auth-form.hbs
+index c782b341c6..1782910374 100644
+--- a/ui/app/templates/components/auth-form.hbs
++++ b/ui/app/templates/components/auth-form.hbs
+@@ -39,6 +39,7 @@
+         @labelAttribute={{'typeDisplay'}}
+         @isFullwidth={{true}}
+         @selectedValue={{this.selectedAuth}}
++        @disabled={{authenticate.isRunning}}
+         @onChange={{action (mut this.selectedAuth)}}
+         />
+     {{/if}}
+@@ -64,57 +65,111 @@
+       />
+     </AuthJwt>
+   {{else}}
+-    <form
+-      id="auth-form"
+-      onsubmit={{action "doSubmit"}}
+-    >
+-        {{#if (eq providerName 'github')}}
+-          <div class="field">
+-            <label for="token" class="is-label">GitHub token</label>
+-            <div class="control">
+-              <Input @type="password" @value={{token}} @name="token" @id="token" class="input" data-test-token={{true}} @autocomplete="off" @spellcheck="false" />
++    <form id="auth-form" onsubmit={{action "doSubmit"}}>
++      {{#if (eq providerName 'github')}}
++        <div class="field">
++          <label for="token" class="is-label">GitHub token</label>
++          <div class="control">
++            <Input @type="password" @value={{token}} @name="token" @id="token" class="input" data-test-token={{true}} @autocomplete="off" @spellcheck="false" />
++          </div>
++        </div>
++      {{else if (eq providerName 'gitlab')}}
++        <div class="level-left">
++          <div class="control">
++            {{#if authenticate.isRunning }}
++                <button type="button" disabled="disabled" class="button is-primary auto-width is-loading" id="oauth2-submit">
++                  OAuth2 Sign In
++                </button>
++            {{else}}
++              <a href="/v1/auth/gitlab/oauth">
++                <button type="button" class="button is-primary auto-width" id="oauth2-submit">
++                  OAuth2 Sign In
++                </button>
++              </a>
++            {{/if}}
++          </div>
++        </div>
++        <div class="level-right">
++          <div class="field is-horizontal is-flex-end is-single-line">
++            <div class="control is-flex">
++              {{input
++                id="userPassToggle"
++                type="checkbox"
++                name="userPassToggle"
++                class="switch is-rounded is-success is-small"
++                checked=showUserPass
++                change=(toggle-action "showUserPass" this)
++                data-test-userpass-toggle=true
++                disabled=authenticate.isRunning
++              }}
++              <label for="userPassToggle">Username / Password</label>
+             </div>
+           </div>
+-        {{else if (eq providerName 'token')}}
++        </div>
++        {{#unless showUserPass}}
+           <div class="field">
+-            <label for="token" class="is-label">Token</label>
++            <label for="token" class="is-label">Gitlab Token</label>
+             <div class="control">
+-              <Input @type="password" @value={{token}} @name="token" class="input" @autocomplete="off" @spellcheck="false" data-test-token={{true}} />
++              {{input
++                type="password"
++                value=token
++                name="token"
++                id="token"
++                class="input"
++                data-test-token=true
++                autocomplete="off"
++                disabled=authenticate.isRunning
++              }}
+             </div>
+           </div>
+         {{else}}
+           <div class="field">
+             <label for="username" class="is-label">Username</label>
+             <div class="control">
+-              <Input @value={{username}} @name="username" @id="username" class="input" @autocomplete="off" @spellcheck="false" data-test-username={{true}} />
++              <Input @value={{username}} @name="username" @id="username" class="input" @disabled={{authenticate.isRunning}} @autocomplete="off" @spellcheck="false" data-test-username={{true}} />
+             </div>
+           </div>
+           <div class="field">
+             <label for="password" class="is-label">Password</label>
+             <div class="control">
+-              <Input @value={{password}} @name="password" @id="password" @type="password" class="input" @autocomplete="off" @spellcheck="false" data-test-password={{true}} />
++              <Input @value={{password}} @name="password" @id="password" @type="password" class="input" @disabled={{authenticate.isRunning}} @autocomplete="off" @spellcheck="false" data-test-password={{true}} />
+             </div>
+           </div>
+-        {{/if}}
+-        {{#if (not-eq selectedAuthBackend.type "token")}}
+-          <AuthFormOptions
+-            @customPath={{this.customPath}}
+-            @onPathChange={{action (mut this.customPath)}}
+-            @selectedAuthIsPath={{this.selectedAuthIsPath}}
+-          />
+-        {{/if}}
+-        <button data-test-auth-submit=true type="submit" disabled={{authenticate.isRunning}} class="button is-primary {{if authenticate.isRunning 'is-loading'}}" id="auth-submit">
+-          Sign In
+-        </button>
+-        {{#if (and delayAuthMessageReminder.isIdle showLoading)}}
+-          <AlertInline
+-            @paddingTop=true
+-            @sizeSmall=true
+-            @type="info"
+-            @message="If login takes longer than usual, you may need to check your device for an MFA notification, or contact your administrator if login times out."
+-            data-test-auth-message="push"
+-          />
+-        {{/if}}
++        {{/unless}}
++      {{else if (eq providerName 'token')}}
++        <div class="field">
++          <label for="token" class="is-label">Token</label>
++          <div class="control">
++            <Input @type="password" @value={{token}} @name="token" class="input" @autocomplete="off" @spellcheck="false" data-test-token={{true}} />
++          </div>
++        </div>
++      {{else}}
++        <div class="field">
++          <label for="username" class="is-label">Username</label>
++          <div class="control">
++            <Input @value={{username}} @name="username" @id="username" class="input" @autocomplete="off" @spellcheck="false" data-test-username={{true}} />
++          </div>
++        </div>
++        <div class="field">
++          <label for="password" class="is-label">Password</label>
++          <div class="control">
++            <Input @value={{password}} @name="password" @id="password" @type="password" class="input" @autocomplete="off" @spellcheck="false" data-test-password={{true}} />
++          </div>
++        </div>
++      {{/if}}
++
++      <button data-test-auth-submit=true type="submit" disabled={{authenticate.isRunning}} class="button is-primary {{if authenticate.isRunning 'is-loading'}}" id="auth-submit">
++        Sign In
++      </button>
++      {{#if (and delayAuthMessageReminder.isIdle showLoading)}}
++        <AlertInline
++          @paddingTop=true
++          @sizeSmall=true
++          @type="info"
++          @message="If login takes longer than usual, you may need to check your device for an MFA notification, or contact your administrator if login times out."
++          data-test-auth-message="push"
++        />
++      {{/if}}
+     </form>
+   {{/if}}
+   </div>
+diff --git a/ui/app/templates/components/wizard/gitlab-method.hbs b/ui/app/templates/components/wizard/gitlab-method.hbs
+new file mode 100644
+index 0000000000..f3d95a1762
+--- /dev/null
++++ b/ui/app/templates/components/wizard/gitlab-method.hbs
+@@ -0,0 +1,10 @@
++<WizardSection
++  @headerText="Gitlab"
++  @headerIcon="enable/gitlab"
++  @docText="Docs: Gitlab Authentication"
++  @docPath="/docs/auth/gitlab.html"
++>
++  <p>
++    The Gitlab auth method can be used to authenticate with Vault using a Gitlab access token.
++  </p>
++</WizardSection>
+diff --git a/ui/lib/core/addon/templates/components/select.hbs b/ui/lib/core/addon/templates/components/select.hbs
+index 591d85b0f2..a24baa3930 100644
+--- a/ui/lib/core/addon/templates/components/select.hbs
++++ b/ui/lib/core/addon/templates/components/select.hbs
+@@ -11,6 +11,7 @@
+   <div class="control {{if isInline "select is-inline-block"}}">
+     <div class="select {{if isFullwidth "is-fullwidth"}}">
+     <select
++      disabled={{disabled}}
+       class="select"
+       id="select-{{this.elementId}}"
+       onchange={{action this.onChange value="target.value"}}
+diff --git a/ui/public/eco/gitlab.svg b/ui/public/eco/gitlab.svg
+new file mode 100644
+index 0000000000..a658fb263c
+--- /dev/null
++++ b/ui/public/eco/gitlab.svg
+@@ -0,0 +1 @@
++<svg width="{{size}}" height="{{size}}" viewBox="0 0 210 194" xmlns="http://www.w3.org/2000/svg"><path d="M105.061 193.655l38.64-118.921h-77.28l38.64 118.921z" fill="#E24329"/><path d="M105.061 193.655L66.421 74.734H12.268l92.793 118.92z" fill="#FC6D26"/><path d="M12.268 74.734L.526 110.874a8 8 0 0 0 2.907 8.943l101.628 73.838-92.793-118.92z" fill="#FCA326"/><path d="M12.268 74.734h54.153L43.148 3.11c-1.197-3.686-6.41-3.685-7.608 0L12.27 74.734z" fill="#E24329"/><path d="M105.061 193.655l38.64-118.921h54.153l-92.793 118.92z" fill="#FC6D26"/><path d="M197.854 74.734l11.742 36.14a8 8 0 0 1-2.906 8.943l-101.629 73.838 92.793-118.92z" fill="#FCA326"/><path d="M197.854 74.734h-54.153L166.974 3.11c1.197-3.686 6.411-3.685 7.608 0l23.272 71.625z" fill="#E24329"/></svg>
+diff --git a/ui/tests/acceptance/settings/auth/configure/section-test.js b/ui/tests/acceptance/settings/auth/configure/section-test.js
+index faa632603a..a2055cb5b7 100644
+--- a/ui/tests/acceptance/settings/auth/configure/section-test.js
++++ b/ui/tests/acceptance/settings/auth/configure/section-test.js
+@@ -11,45 +11,45 @@ import authPage from 'vault/tests/pages/auth';
+ const cli = create(consolePanel);
+ 
+ module('Acceptance | settings/auth/configure/section', function(hooks) {
+-  setupApplicationTest(hooks);
++    setupApplicationTest(hooks);
+ 
+-  hooks.beforeEach(function() {
+-    this.server = apiStub({ usePassthrough: true });
+-    return authPage.login();
+-  });
+-
+-  hooks.afterEach(function() {
+-    this.server.shutdown();
+-  });
++    hooks.beforeEach(function() {
++        this.server = apiStub({ usePassthrough: true });
++        return authPage.login();
++    });
+ 
+-  test('it can save options', async function(assert) {
+-    const path = `approle-${new Date().getTime()}`;
+-    const type = 'approle';
+-    const section = 'options';
+-    await enablePage.enable(type, path);
+-    await page.visit({ path, section });
+-    await page.fillInTextarea('description', 'This is AppRole!');
+-    await page.save();
+-    assert.equal(
+-      page.flash.latestMessage,
+-      `The configuration was saved successfully.`,
+-      'success flash shows'
+-    );
+-    let tuneRequest = this.server.passthroughRequests.filterBy('url', `/v1/sys/mounts/auth/${path}/tune`)[0];
+-    let keys = Object.keys(JSON.parse(tuneRequest.requestBody));
+-    assert.ok(keys.includes('default_lease_ttl'), 'passes default_lease_ttl on tune');
+-    assert.ok(keys.includes('max_lease_ttl'), 'passes max_lease_ttl on tune');
+-  });
++    hooks.afterEach(function() {
++        this.server.shutdown();
++    });
+ 
+-  for (let type of ['aws', 'azure', 'gcp', 'github', 'kubernetes']) {
+-    test(`it shows tabs for auth method: ${type}`, async assert => {
+-      let path = `${type}-${Date.now()}`;
+-      await cli.consoleInput(`write sys/auth/${path} type=${type}`);
+-      await cli.enter();
+-      await indexPage.visit({ path });
+-      // aws has 4 tabs, the others will have 'Configuration' and 'Method Options' tabs
+-      let numTabs = type === 'aws' ? 4 : 2;
+-      assert.equal(page.tabs.length, numTabs, 'shows correct number of tabs');
++    test('it can save options', async function(assert) {
++        const path = `approle-${new Date().getTime()}`;
++        const type = 'approle';
++        const section = 'options';
++        await enablePage.enable(type, path);
++        await page.visit({ path, section });
++        await page.fillInTextarea('description', 'This is AppRole!');
++        await page.save();
++        assert.equal(
++            page.flash.latestMessage,
++            `The configuration was saved successfully.`,
++            'success flash shows'
++        );
++        let tuneRequest = this.server.passthroughRequests.filterBy('url', `/v1/sys/mounts/auth/${path}/tune`)[0];
++        let keys = Object.keys(JSON.parse(tuneRequest.requestBody));
++        assert.ok(keys.includes('default_lease_ttl'), 'passes default_lease_ttl on tune');
++        assert.ok(keys.includes('max_lease_ttl'), 'passes max_lease_ttl on tune');
+     });
+-  }
++
++    for (let type of ['aws', 'azure', 'gcp', 'github', 'gitlab', 'kubernetes']) {
++        test(`it shows tabs for auth method: ${type}`, async assert => {
++            let path = `${type}-${Date.now()}`;
++            await cli.consoleInput(`write sys/auth/${path} type=${type}`);
++            await cli.enter();
++            await indexPage.visit({ path });
++            // aws has 4 tabs, the others will have 'Configuration' and 'Method Options' tabs
++            let numTabs = type === 'aws' ? 4 : 2;
++            assert.equal(page.tabs.length, numTabs, 'shows correct number of tabs');
++        });
++    }
+ });

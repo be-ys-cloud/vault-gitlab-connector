@@ -6,8 +6,8 @@ Documentation is still WIP.
 
 ## How it works
 * Vault clone, and patches injection are done through the `patch.sh` script. You must provide him a version (eg: `patch.sh v1.13.0`)
-* You must add the changed/created files into the `patches` folder. Create a subfolder with the version name you are patching.
-* The `patch.sh` script takes Vault source-code, and checkout to the version you specified. Then, it copies files in place of the checked ones.
+* You must add the patch file into the `patches` folder.
+* The `patch.sh` script takes Vault source-code, and checkout to the version you specified. Then, it applies script in place of the checked ones.
 * You are now able to dev or build using the patched sources.
 
 ## Update strategy
