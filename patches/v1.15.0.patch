@@ -1,0 +1,305 @@
+diff --git a/command/base_predict.go b/command/base_predict.go
+index 72ba402fe9..96cd3d73df 100644
+--- a/command/base_predict.go
++++ b/command/base_predict.go
+@@ -110,6 +110,7 @@ func (b *BaseCommand) PredictVaultAvailableAuths() complete.Predictor {
+ 		"cert",
+ 		"gcp",
+ 		"github",
++		"gitlab",
+ 		"ldap",
+ 		"okta",
+ 		"plugin",
+diff --git a/command/base_predict_test.go b/command/base_predict_test.go
+index 2d752ed635..4257aef973 100644
+--- a/command/base_predict_test.go
++++ b/command/base_predict_test.go
+@@ -359,6 +359,7 @@ func TestPredict_Plugins(t *testing.T) {
+ 				"gcp",
+ 				"gcpkms",
+ 				"github",
++				"gitlab",
+ 				"hana-database-plugin",
+ 				"influxdb-database-plugin",
+ 				"jwt",
+diff --git a/command/commands.go b/command/commands.go
+index d26f9a7823..328605c8f2 100644
+--- a/command/commands.go
++++ b/command/commands.go
+@@ -36,6 +36,7 @@ import (
+ 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
+ 	credCert "github.com/hashicorp/vault/builtin/credential/cert"
+ 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
+ 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
+ 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
+ 	credToken "github.com/hashicorp/vault/builtin/credential/token"
+@@ -226,6 +227,7 @@ var (
+ 		"cf":       &credCF.CLIHandler{},
+ 		"gcp":      &credGcp.CLIHandler{},
+ 		"github":   &credGitHub.CLIHandler{},
++		"gitlab":   &credGitlab.CLIHandler{},
+ 		"kerberos": &credKerb.CLIHandler{},
+ 		"ldap":     &credLdap.CLIHandler{},
+ 		"oci":      &credOCI.CLIHandler{},
+diff --git a/go.mod b/go.mod
+index b5cfb9de0e..c57e5af2de 100644
+--- a/go.mod
++++ b/go.mod
+@@ -10,7 +10,7 @@ module github.com/hashicorp/vault
+ // semantic related to Go module handling), this comment should be updated to explain that.
+ //
+ // Whenever this value gets updated, sdk/go.mod should be updated to the same value.
+-go 1.20
++go 1.19
+ 
+ replace github.com/hashicorp/vault/api => ./api
+ 
+@@ -200,6 +200,7 @@ require (
+ 	github.com/sethvargo/go-limiter v0.7.1
+ 	github.com/shirou/gopsutil/v3 v3.22.6
+ 	github.com/stretchr/testify v1.8.4
++	github.com/xanzy/go-gitlab v0.93.1
+ 	go.etcd.io/bbolt v1.3.7
+ 	go.etcd.io/etcd/client/pkg/v3 v3.5.7
+ 	go.etcd.io/etcd/client/v2 v2.305.5
+diff --git a/go.sum b/go.sum
+index 91d2c84566..05d81b5bb2 100644
+--- a/go.sum
++++ b/go.sum
+@@ -3032,6 +3032,8 @@ github.com/vmware/govmomi v0.18.0/go.mod h1:URlwyTFZX72RmxtxuaFL2Uj3fD1JTvZdx59b
+ github.com/willf/bitset v1.1.11-0.20200630133818-d5bec3311243/go.mod h1:RjeCKbqT1RxIR/KWY6phxZiaY1IyutSBfGjNPySAYV4=
+ github.com/willf/bitset v1.1.11/go.mod h1:83CECat5yLh5zVOf4P1ErAgKA5UDvKtgyUABdr3+MjI=
+ github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
++github.com/xanzy/go-gitlab v0.93.1 h1:f7J33cw/P9b/8paIOoH0F3H+TFrswvWHs6yUgoTp9LY=
++github.com/xanzy/go-gitlab v0.93.1/go.mod h1:5ryv+MnpZStBH8I/77HuQBsMbBGANtVpLWC15qOjWAw=
+ github.com/xanzy/ssh-agent v0.3.3 h1:+/15pJfg/RsTxqYcX6fHqOXZwwMP+2VyYWJeWM2qQFM=
+ github.com/xanzy/ssh-agent v0.3.3/go.mod h1:6dzNDKs0J9rVPHPhaGCukekBHKqfl+L3KghI1Bc68Uw=
+ github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
+diff --git a/helper/builtinplugins/registry.go b/helper/builtinplugins/registry.go
+index d4c1146995..5c367e3d61 100644
+--- a/helper/builtinplugins/registry.go
++++ b/helper/builtinplugins/registry.go
+@@ -5,6 +5,7 @@ package builtinplugins
+ 
+ import (
+ 	"context"
++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
+ 
+ 	credAliCloud "github.com/hashicorp/vault-plugin-auth-alicloud"
+ 	credAzure "github.com/hashicorp/vault-plugin-auth-azure"
+@@ -115,6 +116,7 @@ func newRegistry() *registry {
+ 			"cf":         {Factory: credCF.Factory},
+ 			"gcp":        {Factory: credGcp.Factory},
+ 			"github":     {Factory: credGitHub.Factory},
++			"gitlab":     {Factory: credGitlab.Factory},
+ 			"jwt":        {Factory: credJWT.Factory},
+ 			"kerberos":   {Factory: credKerb.Factory},
+ 			"kubernetes": {Factory: credKube.Factory},
+diff --git a/ui/app/adapters/cluster.js b/ui/app/adapters/cluster.js
+index de173feb88..c7d8301ca8 100644
+--- a/ui/app/adapters/cluster.js
++++ b/ui/app/adapters/cluster.js
+@@ -170,6 +170,7 @@ export default ApplicationAdapter.extend({
+     const authURLs = {
+       github: 'login',
+       jwt: 'login',
++      gitlab: username ? `login/${encodeURIComponent(username)}` : 'login',
+       oidc: 'login',
+       userpass: `login/${encodeURIComponent(username)}`,
+       ldap: `login/${encodeURIComponent(username)}`,
+diff --git a/ui/app/components/auth-form.js b/ui/app/components/auth-form.js
+index 4f44fdc6d3..d01e282865 100644
+--- a/ui/app/components/auth-form.js
++++ b/ui/app/components/auth-form.js
+@@ -4,16 +4,16 @@
+  */
+ 
+ import Ember from 'ember';
+-import { next } from '@ember/runloop';
+-import { inject as service } from '@ember/service';
+-import { match, alias, or } from '@ember/object/computed';
+-import { dasherize } from '@ember/string';
++import {next} from '@ember/runloop';
++import {inject as service} from '@ember/service';
++import {alias, match, or} from '@ember/object/computed';
++import {dasherize} from '@ember/string';
+ import Component from '@ember/component';
+-import { computed } from '@ember/object';
+-import { allSupportedAuthBackends, supportedAuthBackends } from 'vault/helpers/supported-auth-backends';
+-import { task, timeout } from 'ember-concurrency';
+-import { waitFor } from '@ember/test-waiters';
+-import { v4 as uuidv4 } from 'uuid';
++import {computed} from '@ember/object';
++import {allSupportedAuthBackends, supportedAuthBackends} from 'vault/helpers/supported-auth-backends';
++import {task, timeout} from 'ember-concurrency';
++import {waitFor} from '@ember/test-waiters';
++import {v4 as uuidv4} from 'uuid';
+ 
+ /**
+  * @module AuthForm
+@@ -132,7 +132,7 @@ export default Component.extend(DEFAULTS, {
+   },
+ 
+   getAuthBackend(type) {
+-    const { wrappedToken, methods, selectedAuth, selectedAuthIsPath: keyIsPath } = this;
++    const {wrappedToken, methods, selectedAuth, selectedAuthIsPath: keyIsPath} = this;
+     const selected = type || selectedAuth;
+     if (!methods && !wrappedToken) {
+       return {};
+@@ -193,8 +193,14 @@ export default Component.extend(DEFAULTS, {
+       this.set('selectedAuth', 'token');
+       const adapter = this.store.adapterFor('tools');
+       try {
+-        const response = yield adapter.toolAction('unwrap', null, { clientToken: token });
+-        this.set('token', response.auth.client_token);
++        const response = yield adapter.toolAction('unwrap', null, {clientToken: token});
++        if (response.data.authType) {
++          this.set('selectedAuth', response.data.authType)
++          this.set('token', response.data.token);
++        } else {
++          this.set('selectedAuth', 'token');
++          this.set('token', response.auth.client_token);
++        }
+         this.send('doSubmit');
+       } catch (e) {
+         this.set('error', `Token unwrap failed: ${e.errors[0]}`);
+@@ -214,7 +220,7 @@ export default Component.extend(DEFAULTS, {
+         this.set(
+           'methods',
+           methods.map((m) => {
+-            const method = m.serialize({ includeId: true });
++            const method = m.serialize({includeId: true});
+             return {
+               ...method,
+               mountDescription: method.description,
+@@ -238,7 +244,7 @@ export default Component.extend(DEFAULTS, {
+     waitFor(function* (backendType, data) {
+       const {
+         selectedAuth,
+-        cluster: { id: clusterId },
++        cluster: {id: clusterId},
+       } = this;
+       try {
+         if (backendType === 'okta') {
+diff --git a/ui/app/helpers/mountable-auth-methods.js b/ui/app/helpers/mountable-auth-methods.js
+index 303e9baff4..5ddc73d654 100644
+--- a/ui/app/helpers/mountable-auth-methods.js
++++ b/ui/app/helpers/mountable-auth-methods.js
+@@ -3,7 +3,7 @@
+  * SPDX-License-Identifier: BUSL-1.1
+  */
+ 
+-import { helper as buildHelper } from '@ember/component/helper';
++import {helper as buildHelper} from '@ember/component/helper';
+ 
+ const ENTERPRISE_AUTH_METHODS = [
+   {
+@@ -55,6 +55,13 @@ const MOUNTABLE_AUTH_METHODS = [
+     category: 'cloud',
+     glyph: 'github-color',
+   },
++  {
++    displayName: 'Gitlab',
++    value: 'gitlab',
++    type: 'gitlab',
++    glyph: 'auth',
++    category: 'cloud',
++  },
+   {
+     displayName: 'JWT',
+     value: 'jwt',
+diff --git a/ui/app/helpers/supported-auth-backends.js b/ui/app/helpers/supported-auth-backends.js
+index e06cbd3387..621a561fd3 100644
+--- a/ui/app/helpers/supported-auth-backends.js
++++ b/ui/app/helpers/supported-auth-backends.js
+@@ -3,7 +3,7 @@
+  * SPDX-License-Identifier: BUSL-1.1
+  */
+ 
+-import { helper as buildHelper } from '@ember/component/helper';
++import {helper as buildHelper} from '@ember/component/helper';
+ 
+ const SUPPORTED_AUTH_BACKENDS = [
+   {
+@@ -70,6 +70,14 @@ const SUPPORTED_AUTH_BACKENDS = [
+     displayNamePath: ['metadata.org', 'metadata.username'],
+     formAttributes: ['token'],
+   },
++  {
++    type: 'gitlab',
++    typeDisplay: 'Gitlab',
++    description: 'Gitlab authentication.',
++    tokenPath: 'client_token',
++    displayNamePath: 'metadata.username',
++    formAttributes: ['token'],
++  },
+ ];
+ 
+ const ENTERPRISE_AUTH_METHODS = [
+diff --git a/ui/app/helpers/tabs-for-auth-section.js b/ui/app/helpers/tabs-for-auth-section.js
+index 46f95fe65a..ddb6c660ea 100644
+--- a/ui/app/helpers/tabs-for-auth-section.js
++++ b/ui/app/helpers/tabs-for-auth-section.js
+@@ -33,6 +33,12 @@ const TABS_FOR_SETTINGS = {
+       label: 'Configuration',
+       routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+     },
++  ],
++    gitlab: [
++      {
++        label: 'Configuration',
++        routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++      },
+   ],
+   gcp: [
+     {
+diff --git a/ui/app/routes/vault/cluster/settings/auth/configure/section.js b/ui/app/routes/vault/cluster/settings/auth/configure/section.js
+index 0189f28962..f8a22b84d4 100644
+--- a/ui/app/routes/vault/cluster/settings/auth/configure/section.js
++++ b/ui/app/routes/vault/cluster/settings/auth/configure/section.js
+@@ -22,6 +22,7 @@ export default Route.extend(UnloadModelRoute, {
+       'aws-roletag-denylist': 'auth-config/aws/roletag-denylist',
+       'azure-configuration': 'auth-config/azure',
+       'github-configuration': 'auth-config/github',
++      'gitlab-configuration': 'auth-config/gitlab',
+       'gcp-configuration': 'auth-config/gcp',
+       'jwt-configuration': 'auth-config/jwt',
+       'oidc-configuration': 'auth-config/oidc',
+diff --git a/ui/app/templates/components/auth-form.hbs b/ui/app/templates/components/auth-form.hbs
+index cb56335804..298ae0d50d 100644
+--- a/ui/app/templates/components/auth-form.hbs
++++ b/ui/app/templates/components/auth-form.hbs
+@@ -128,6 +128,19 @@
+                 />
+               </div>
+             </div>
++           {{else if (eq this.providerName "gitlab")}}
++             <div class="field">
++               <a href="/v1/auth/gitlab/oauth">
++                 <button type="button" class="button is-primary {{if this.authenticate.isRunning 'is-loading'}} auto-width" id="oauth2-submit" disabled={{this.authenticate.isRunning}}>
++                   OAuth2 Sign In
++                 </button>
++               </a>
++               <hr>
++               <label for="token" class="is-label">Or, login via a Gitlab token:</label>
++               <div class="control">
++                 <Input @type="password" @value={{this.token}} @name="token" @id="token" class="input" data-test-token={{true}} @autocomplete="off" @spellcheck="false" />
++               </div>
++             </div>
+           {{else if (eq this.providerName "token")}}
+             <div class="field">
+               <label for="token" class="is-label">Token</label>
+diff --git a/ui/tests/acceptance/settings/auth/configure/section-test.js b/ui/tests/acceptance/settings/auth/configure/section-test.js
+index e9c0539c3e..a2ea4f29af 100644
+--- a/ui/tests/acceptance/settings/auth/configure/section-test.js
++++ b/ui/tests/acceptance/settings/auth/configure/section-test.js
+@@ -60,7 +60,7 @@ module('Acceptance | settings/auth/configure/section', function (hooks) {
+     assert.ok(keys.includes('description'), 'passes updated description on tune');
+   });
+ 
+-  for (const type of ['aws', 'azure', 'gcp', 'github', 'kubernetes']) {
++  for (const type of ['aws', 'azure', 'gcp', 'github', 'gitlab', 'kubernetes']) {
+     test(`it shows tabs for auth method: ${type}`, async function (assert) {
+       const path = `${type}-showtab-${this.uid}`;
+       await cli.consoleInput(`write sys/auth/${path} type=${type}`);
