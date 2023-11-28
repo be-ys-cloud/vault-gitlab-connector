@@ -1,4 +1,4 @@
-FROM golang:1.21.1-bullseye as build
+FROM golang:1.21.3-bullseye as build
 
 RUN mkdir /builddir
 WORKDIR /builddir
@@ -12,7 +12,7 @@ RUN make bootstrap static-dist bin
 
 FROM alpine:3.17 as run
 COPY --from=build /builddir/bin/vault /opt/vault
-COPY configuration.json /opt/configuration.json
+COPY docker/configuration.json /opt/configuration.json
 EXPOSE 8200
 WORKDIR /opt
 ENTRYPOINT ["./vault"]
