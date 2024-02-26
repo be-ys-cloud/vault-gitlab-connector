@@ -1,4 +1,4 @@
-FROM golang:1.21.3-bullseye as build
+FROM golang:1.21.5-bullseye as build
 
 RUN mkdir /builddir
 WORKDIR /builddir
@@ -10,7 +10,7 @@ ENV XC_OSARCH linux/amd64
 RUN go mod tidy
 RUN make bootstrap static-dist bin
 
-FROM alpine:3.17 as run
+FROM alpine:3.19 as run
 COPY --from=build /builddir/bin/vault /opt/vault
 COPY docker/configuration.json /opt/configuration.json
 EXPOSE 8200
