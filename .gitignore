@@ -37,3 +37,6 @@ build/
 /vault.bin.tar.gz
 /vault/
 /data/
+
+## Configuration for development ##
+/configuration.json

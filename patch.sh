@@ -1,7 +1,7 @@
 #!/bin/sh
 
 if [ -z "$1" ]; then
-  echo "ERROR : You must define a variable."
+  echo "ERROR : You must define a version."
   exit 1
 fi
 

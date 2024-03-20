@@ -1,6 +1,10 @@
 # Vault Patches
 
-Project who takes [HashiCorp Vault](https://github.com/hashicorp/vault/) sources, and add Gitlab interconnexion on it.
+Project which takes [HashiCorp Vault](https://github.com/hashicorp/vault/) sources, and add Gitlab interconnexion on it.
+
+> ***Warning*** : Before v1.15.6, policies had different name format.  
+> Before migration to v1.15.6, don't forget to duplicate all your policies with the new formatted names.  
+> After migration, you'll be able to remove old policies.
 
 ## Building the image
 
@@ -92,9 +96,9 @@ Basically, Vault will replace all non-alphanumeric characters from the group/pro
 concatenate the user role after it. A few examples to fully understand it:
 
 * A user have access to `group/project1` with role `maintainer`
-    * The matching policy will be named `group_project1_maintainer`.
+    * The matching policy will be named `group:project1:maintainer`.
 * A user have access to `group-one/` with role `owner`, and `group-two/very/long/pa-th/project` with role `reporter`
-    * The matching policies will be named `group_one_owner` and `group_two_very_long_pa_th_project_reporter`
+    * The matching policies will be named `group_one:owner` and `group_two:very:long:pa_th:project:reporter`
 
 Every matching Vault policy will be loaded to the user token.
 
