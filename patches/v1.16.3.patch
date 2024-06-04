@@ -1,0 +1,1646 @@
+diff --git a/builtin/credential/gitlab/backend.go b/builtin/credential/gitlab/backend.go
+new file mode 100644
+index 0000000000..77fed07c34
+--- /dev/null
++++ b/builtin/credential/gitlab/backend.go
+@@ -0,0 +1,52 @@
++package gitlab
++
++import (
++	"context"
++	"github.com/hashicorp/vault/sdk/framework"
++	"github.com/hashicorp/vault/sdk/logical"
++	mathrand "math/rand"
++)
++
++const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++
++// Factory of gitlab backend
++func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
++	b := Backend()
++	if err := b.Setup(ctx, conf); err != nil {
++		return nil, err
++	}
++	b.CipherKey = make([]byte, 16)
++	for i := range b.CipherKey {
++		b.CipherKey[i] = letterBytes[mathrand.Intn(len(letterBytes))]
++	}
++	return b, nil
++}
++
++// Backend constructor
++func Backend() *backend {
++
++	var b backend
++
++	b.Backend = &framework.Backend{
++		Help:         backendHelp,
++		PathsSpecial: &logical.Paths{Unauthenticated: []string{"login", "login/*", "oauth", "ci"}},
++		Paths:        append([]*framework.Path{pathConfig(&b), pathLoginToken(&b), pathOauthLogin(&b), pathLoginJob(&b)}),
++		BackendType:  logical.TypeCredential,
++	}
++
++	return &b
++}
++
++type backend struct {
++	*framework.Backend
++	CipherKey []byte
++}
++
++const backendHelp = `
++The Gitlab credential provider allows authentication via Gitlab.
++
++Users provide a personal access token to log in, and the credential
++provider maps the user to a set of Vault policies according to the groups he is part of.
++After enabling the credential provider, use the "config" route to
++configure it.
++`
+diff --git a/builtin/credential/gitlab/backend_test.go b/builtin/credential/gitlab/backend_test.go
+new file mode 100644
+index 0000000000..99b34095dc
+--- /dev/null
++++ b/builtin/credential/gitlab/backend_test.go
+@@ -0,0 +1,165 @@
++package gitlab
++
++import (
++	"context"
++	"os"
++	"strings"
++	"testing"
++
++	logicaltest "github.com/hashicorp/vault/helper/testhelpers/logical"
++	"github.com/hashicorp/vault/sdk/logical"
++)
++
++func TestBackend_Config(t *testing.T) {
++	b, err := Factory(context.Background(), &logical.BackendConfig{
++		Logger: nil,
++	})
++	if err != nil {
++		t.Fatalf("Unable to create backend: %s", err)
++	}
++
++	loginData := map[string]interface{}{
++		// This token has to be replaced with a working token for the test to work.
++		"token": os.Getenv("GITLAB_TOKEN"),
++	}
++	configData := map[string]interface{}{
++		"group": os.Getenv("GITLAB_GROUP"),
++	}
++
++	logicaltest.Test(t, logicaltest.TestCase{
++		PreCheck:       func() { testAccPreCheck(t) },
++		LogicalBackend: b,
++		Steps: []logicaltest.TestStep{
++			testConfigWrite(t, loginData),
++			testLoginWrite(t, configData, false),
++		},
++	})
++}
++
++func testLoginWrite(t *testing.T, d map[string]interface{}, expectFail bool) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "login",
++		ErrorOk:   true,
++		Data:      d,
++		Check: func(resp *logical.Response) error {
++			if resp.IsError() && expectFail {
++				return nil
++			}
++			return nil
++		},
++	}
++}
++
++func testConfigWrite(t *testing.T, d map[string]interface{}) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "config",
++		Data:      d,
++	}
++}
++
++func TestBackend_basic(t *testing.T) {
++	b, err := Factory(context.Background(), &logical.BackendConfig{
++		Logger: nil,
++	})
++	if err != nil {
++		t.Fatalf("Unable to create backend: %s", err)
++	}
++
++	logicaltest.Test(t, logicaltest.TestCase{
++		PreCheck:       func() { testAccPreCheck(t) },
++		LogicalBackend: b,
++		Steps: []logicaltest.TestStep{
++			testAccStepConfig(t, false),
++			testAccMap(t, "default", "fakepol"),
++			testAccMap(t, "oWnErs", "fakepol"),
++			testAccLogin(t, []string{"default", "fakepol"}),
++			testAccStepConfig(t, true),
++			testAccMap(t, "default", "fakepol"),
++			testAccMap(t, "oWnErs", "fakepol"),
++			testAccLogin(t, []string{"default", "fakepol"}),
++			testAccStepConfigWithBaseURL(t),
++			testAccMap(t, "default", "fakepol"),
++			testAccMap(t, "oWnErs", "fakepol"),
++			testAccLogin(t, []string{"default", "fakepol"}),
++			testAccMap(t, "default", "fakepol"),
++			testAccStepConfig(t, true),
++			mapUserToPolicy(t, os.Getenv("GITLAB_USER"), "userpolicy"),
++			testAccLogin(t, []string{"default", "fakepol", "userpolicy"}),
++		},
++	})
++}
++
++func testAccPreCheck(t *testing.T) {
++	if v := os.Getenv("GITLAB_TOKEN"); v == "" {
++		t.Skip("GITLAB_TOKEN must be set for acceptance tests")
++	}
++
++	if v := os.Getenv("GITLAB_GROUP"); v == "" {
++		t.Skip("GITLAB_GROUP must be set for acceptance tests")
++	}
++
++	if v := os.Getenv("GITLAB_BASEURL"); v == "" {
++		t.Skip("GITLAB_BASEURL must be set for acceptance tests (use 'https://gitlab.com/api/v4/' if you don't know what you're doing)")
++	}
++}
++
++func testAccStepConfig(t *testing.T, upper bool) logicaltest.TestStep {
++	ts := logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "config",
++		Data: map[string]interface{}{
++			"organization": os.Getenv("GITLAB_GROUP"),
++		},
++	}
++	if upper {
++		ts.Data["organization"] = strings.ToUpper(os.Getenv("GITLAB_GROUP"))
++	}
++	return ts
++}
++
++func testAccStepConfigWithBaseURL(t *testing.T) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "config",
++		Data: map[string]interface{}{
++			"organization": os.Getenv("GITLAB_GROUP"),
++			"base_url":     os.Getenv("GITLAB_BASEURL"),
++		},
++	}
++}
++
++func testAccMap(t *testing.T, k string, v string) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "map/teams/" + k,
++		Data: map[string]interface{}{
++			"value": v,
++		},
++	}
++}
++
++func mapUserToPolicy(t *testing.T, k string, v string) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "map/users/" + k,
++		Data: map[string]interface{}{
++			"value": v,
++		},
++	}
++}
++
++func testAccLogin(t *testing.T, policies []string) logicaltest.TestStep {
++	return logicaltest.TestStep{
++		Operation: logical.UpdateOperation,
++		Path:      "login",
++		Data: map[string]interface{}{
++			"token": os.Getenv("GITLAB_TOKEN"),
++		},
++		Unauthenticated: true,
++
++		Check: logicaltest.TestCheckAuth(policies),
++	}
++}
++
+diff --git a/builtin/credential/gitlab/cli.go b/builtin/credential/gitlab/cli.go
+new file mode 100644
+index 0000000000..6f8ad6d806
+--- /dev/null
++++ b/builtin/credential/gitlab/cli.go
+@@ -0,0 +1,99 @@
++package gitlab
++
++import (
++"fmt"
++"io"
++"os"
++"strings"
++
++"github.com/hashicorp/errwrap"
++"github.com/hashicorp/vault/api"
++"github.com/hashicorp/vault/sdk/helper/password"
++)
++
++// CLIHandler structure
++type CLIHandler struct {
++	// for tests
++	testStdout io.Writer
++}
++
++// Auth return secret token
++func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (*api.Secret, error) {
++	mount, ok := m["mount"]
++	if !ok {
++		mount = "gitlab"
++	}
++
++	// Extract or prompt for token
++	token := m["token"]
++	if token == "" {
++		token = os.Getenv("VAULT_AUTH_GITLAB_TOKEN")
++	}
++	if token == "" {
++		// Override the output
++		stdout := h.testStdout
++		if stdout == nil {
++			stdout = os.Stderr
++		}
++
++		var err error
++		fmt.Fprintf(stdout, "Gitlab Access Token (will be hidden): ")
++		token, err = password.Read(os.Stdin)
++		fmt.Fprintf(stdout, "\n")
++		if err != nil {
++			if err == password.ErrInterrupted {
++				return nil, fmt.Errorf("user interrupted")
++			}
++
++			return nil, errwrap.Wrapf("An error occurred attempting to "+
++				"ask for a token. The raw error message is shown below, but usually "+
++				"this is because you attempted to pipe a value into the command or "+
++				"you are executing outside of a terminal (tty). If you want to pipe "+
++				"the value, pass \"-\" as the argument to read from stdin. The raw "+
++				"error was: {{err}}", err)
++		}
++	}
++
++	path := fmt.Sprintf("auth/%s/login", mount)
++	secret, err := c.Logical().Write(path, map[string]interface{}{
++		"token": strings.TrimSpace(token),
++	})
++	if err != nil {
++		return nil, err
++	}
++	if secret == nil {
++		return nil, fmt.Errorf("empty response from credential provider")
++	}
++
++	return secret, nil
++}
++
++// Help return help message
++func (h *CLIHandler) Help() string {
++	help := `
++Usage: vault login -method=gitlab [CONFIG K=V...]
++
++  The Gitlab auth method allows users to authenticate using a Gitlab
++  access token. Users can generate a personal access token from the
++  settings page on their Gitlab account.
++
++  Authenticate using a Gitlab token:
++
++      $ vault login -method=gitlab token=abcd1234
++
++Configuration:
++
++  mount=<string>
++      Path where the Gitlab credential method is mounted. This is usually
++      provided via the -path flag in the "vault login" command, but it can be
++      specified here as well. If specified here, it takes precedence over the
++      value for -path. The default value is "gitlab".
++
++  token=<string>
++      Gitlab access token to use for authentication. If not provided,
++      Vault will prompt for the value.
++`
++
++	return strings.TrimSpace(help)
++}
++
+diff --git a/builtin/credential/gitlab/clients.go b/builtin/credential/gitlab/clients.go
+new file mode 100644
+index 0000000000..c3212de492
+--- /dev/null
++++ b/builtin/credential/gitlab/clients.go
+@@ -0,0 +1,40 @@
++package gitlab
++
++import (
++	"errors"
++	"github.com/xanzy/go-gitlab"
++	"strconv"
++	"strings"
++)
++
++func (b *backend) TokenClient(baseUrl string, token string) (*gitlab.Client, error) {
++	if strings.HasPrefix(token, "OAuth-") {
++		return gitlab.NewOAuthClient(strings.TrimPrefix(token, "OAuth-"), gitlab.WithBaseURL(baseUrl))
++	}
++	return gitlab.NewClient(token, gitlab.WithBaseURL(baseUrl))
++}
++
++// --------------------------------
++
++func (b *backend) JobClient(baseURL, CIToken, project, job, commit, token string) (*gitlab.Client, error) {
++	client, err := gitlab.NewClient(CIToken, gitlab.WithBaseURL(baseURL))
++	if err != nil {
++		return nil, err
++	}
++
++	jobID, err := strconv.Atoi(job)
++	if err != nil {
++		return nil, err
++	}
++
++	j, _, err := client.Jobs.GetJob(project, jobID)
++	if err != nil {
++		return nil, err
++	}
++
++	if j.Status != string(gitlab.Running) || j.Commit.ID != commit {
++		return nil, errors.New("invalid job arguments")
++	}
++
++	return client, nil
++}
+diff --git a/builtin/credential/gitlab/cmd/gitlab/main.go b/builtin/credential/gitlab/cmd/gitlab/main.go
+new file mode 100644
+index 0000000000..26e3917c23
+--- /dev/null
++++ b/builtin/credential/gitlab/cmd/gitlab/main.go
+@@ -0,0 +1,30 @@
++package main
++
++import (
++	"github.com/hashicorp/vault/api"
++	"github.com/hashicorp/vault/builtin/credential/gitlab"
++	"os"
++
++	hclog "github.com/hashicorp/go-hclog"
++	"github.com/hashicorp/vault/sdk/plugin"
++)
++
++func main() {
++	apiClientMeta := &api.PluginAPIClientMeta{}
++	flags := apiClientMeta.FlagSet()
++	flags.Parse(os.Args[1:])
++
++	tlsConfig := apiClientMeta.GetTLSConfig()
++	tlsProviderFunc := api.VaultPluginTLSProvider(tlsConfig)
++
++	if err := plugin.Serve(&plugin.ServeOpts{
++		BackendFactoryFunc: gitlab.Factory,
++		TLSProviderFunc:    tlsProviderFunc,
++	}); err != nil {
++		logger := hclog.New(&hclog.LoggerOptions{})
++
++		logger.Error("plugin shutting down", "error", err)
++		os.Exit(1)
++	}
++}
++
+diff --git a/builtin/credential/gitlab/path_config.go b/builtin/credential/gitlab/path_config.go
+new file mode 100644
+index 0000000000..23c5f25256
+--- /dev/null
++++ b/builtin/credential/gitlab/path_config.go
+@@ -0,0 +1,194 @@
++package gitlab
++
++import (
++	"context"
++	"fmt"
++	"github.com/hashicorp/errwrap"
++	"github.com/hashicorp/vault/sdk/framework"
++	"github.com/hashicorp/vault/sdk/logical"
++	"github.com/xanzy/go-gitlab"
++	"net/http"
++	"net/url"
++)
++
++func pathConfig(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: "config",
++		Fields: map[string]*framework.FieldSchema{
++			"base_url": {
++				Type:        framework.TypeString,
++				Description: "The Gitlab API endpoint to use.",
++			},
++			"min_access_level": {
++				Type:        framework.TypeString,
++				Description: "The minimal project access level that users must have",
++				Default:     "guest",
++			},
++			"app_id": {
++				Type:        framework.TypeString,
++				Description: "The OAuth appId",
++				Default:     "",
++			},
++			"app_secret": {
++				Type:        framework.TypeString,
++				Description: "The OAuth appSecret",
++				Default:     "",
++			},
++			"callback_url": {
++				Type:        framework.TypeString,
++				Description: "The Vault OAuth API endpoint to use.",
++				Default:     "",
++			},
++			"ci_token": {
++				Type:        framework.TypeString,
++				Description: "The CI token API to use.",
++				Default:     "",
++			},
++		},
++
++		Operations: map[logical.Operation]framework.OperationHandler{
++			logical.UpdateOperation: &framework.PathOperation{
++				Callback: b.pathConfigWrite,
++				Responses: map[int][]framework.Response{
++					http.StatusOK: {{
++						Description: http.StatusText(http.StatusOK),
++					}},
++				},
++			},
++			logical.ReadOperation: &framework.PathOperation{
++				Callback: b.pathConfigRead,
++				Responses: map[int][]framework.Response{
++					http.StatusOK: {{
++						Description: http.StatusText(http.StatusOK),
++					}},
++				},
++			},
++		},
++	}
++}
++
++func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	baseURL := data.Get("base_url").(string)
++	if len(baseURL) > 0 {
++		_, err := url.Parse(baseURL)
++		if err != nil {
++			return logical.ErrorResponse(fmt.Sprintf("Error parsing given base_url: %s", err)), nil
++		}
++	}
++	minAccessLevel := data.Get("min_access_level").(string)
++	appID := data.Get("app_id").(string)
++	appSecret := data.Get("app_secret").(string)
++	callbackURL := data.Get("callback_url").(string)
++	ciToken := data.Get("ci_token").(string)
++	if len(callbackURL) > 0 {
++		_, err := url.Parse(callbackURL)
++		if err != nil {
++			return logical.ErrorResponse(fmt.Sprintf("Error parsing given callback_url: %s", err)), nil
++		}
++	}
++	entry, err := logical.StorageEntryJSON("config", config{
++		BaseURL:        baseURL,
++		MinAccessLevel: minAccessLevel,
++		AppID:          appID,
++		AppSecret:      appSecret,
++		CallbackURL:    callbackURL,
++		CIToken:        ciToken,
++	})
++
++	if err != nil {
++		return nil, err
++	}
++
++	if err := req.Storage.Put(ctx, entry); err != nil {
++		return nil, err
++	}
++
++	return nil, nil
++}
++
++func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++
++	if config == nil {
++		return nil, fmt.Errorf("configuration object not found")
++	}
++
++	resp := &logical.Response{
++		Data: map[string]interface{}{
++			"base_url":         config.BaseURL,
++			"min_access_level": config.MinAccessLevel,
++			"app_id":           config.AppID,
++			"app_secret":       config.AppSecret,
++			"callback_url":     config.CallbackURL,
++			"ci_token":         config.CIToken,
++		},
++	}
++	return resp, nil
++}
++
++// Config returns the configuration for this backend.
++func (b *backend) Config(ctx context.Context, s logical.Storage) (*config, error) {
++	entry, err := s.Get(ctx, "config")
++	if err != nil {
++		return nil, err
++	}
++
++	var result config
++	if entry != nil {
++		if err := entry.DecodeJSON(&result); err != nil {
++			return nil, errwrap.Wrapf("error reading configuration: {{err}}", err)
++		}
++	}
++
++	return &result, nil
++}
++
++func (b *backend) AccessLevelValue(level string) *gitlab.AccessLevelValue {
++	if level == "" {
++		return gitlab.AccessLevel(gitlab.OwnerPermission)
++	}
++	return gitlab.AccessLevel(accessLevelNameToValue[level])
++}
++
++// AllAccessValuesFromLevel Meaning for a owner access, we also have access to developer, guest, etc.
++func (b *backend) AllAccessValuesFromLevel(level string) []string {
++	var accessLevelValues []string
++
++	var start = int(*b.AccessLevelValue(level))
++	for k, v := range accessLevelNameToValue {
++		if int(v) <= start && v != 0 { // not adding "none" level access
++			accessLevelValues = append(accessLevelValues, k)
++		}
++	}
++	return accessLevelValues
++}
++
++func (b *backend) AccessLevelValueToString(level gitlab.AccessLevelValue) string {
++	for k, v := range accessLevelNameToValue {
++		if v == level {
++			return k
++		}
++	}
++	return "none"
++}
++
++var accessLevelNameToValue = map[string]gitlab.AccessLevelValue{
++	"none":       gitlab.NoPermissions,
++	"guest":      gitlab.GuestPermissions,
++	"reporter":   gitlab.ReporterPermissions,
++	"developer":  gitlab.DeveloperPermissions,
++	"maintainer": gitlab.MaintainerPermissions,
++	"owner":      gitlab.OwnerPermissions,
++}
++
++type config struct {
++	BaseURL        string `json:"baseURL" structs:"baseURL" mapstructure:"baseURL"`
++	MinAccessLevel string `json:"minAccessLevel" structs:"minAccessLevel" mapstructure:"minAccessLevel"`
++	AppID          string `json:"appID" structs:"appID" mapstructure:"appID"`
++	AppSecret      string `json:"appSecret" structs:"appSecret" mapstructure:"appSecret"`
++	CallbackURL    string `json:"callbackURL" structs:"callbackURL" mapstructure:"callbackURL"`
++	CIToken        string `json:"ciToken" structs:"ciToken" mapstructure:"ciToken"`
++}
+diff --git a/builtin/credential/gitlab/path_login_commons.go b/builtin/credential/gitlab/path_login_commons.go
+new file mode 100644
+index 0000000000..659205afd6
+--- /dev/null
++++ b/builtin/credential/gitlab/path_login_commons.go
+@@ -0,0 +1,185 @@
++package gitlab
++
++import (
++	"context"
++	"fmt"
++	"github.com/hashicorp/vault/sdk/logical"
++	"github.com/hasura/go-graphql-client"
++	"github.com/xanzy/go-gitlab"
++	"net/http"
++	"strings"
++)
++
++func (b *backend) pathLoginOk(verifyResp *verifyCredentialsResp, internalData map[string]interface{}) *logical.Response {
++	resp := &logical.Response{
++		Auth: &logical.Auth{
++			InternalData: internalData,
++			Metadata: map[string]string{
++				"username": verifyResp.Username,
++			},
++			DisplayName: verifyResp.Username,
++			LeaseOptions: logical.LeaseOptions{
++				Renewable: false,
++			},
++			Alias: &logical.Alias{
++				Name: verifyResp.Username,
++			},
++			EntityID: verifyResp.Username,
++		},
++	}
++
++	if verifyResp.IsAdmin {
++		if b.Logger().IsDebug() {
++			b.Logger().Debug("User " + verifyResp.Username + " is admin")
++		}
++		resp.Auth.Policies = append(resp.Auth.Policies, "admins")
++	}
++
++	for _, name := range verifyResp.Rights {
++		resp.Auth.GroupAliases = append(resp.Auth.GroupAliases, &logical.Alias{Name: name})
++		resp.Auth.Policies = append(resp.Auth.Policies, name)
++	}
++
++	return resp
++}
++
++func (b *backend) parseAdminRights(username string, isAdmin bool, access []string) (*verifyCredentialsResp, error) {
++	if isAdmin {
++		if b.Logger().IsDebug() {
++			b.Logger().Debug("User " + username + " is admin")
++		}
++		access = append(access, "admins")
++	}
++
++	return &verifyCredentialsResp{
++		Username: username,
++		Rights:   access,
++		IsAdmin:  isAdmin,
++	}, nil
++}
++
++func (b *backend) getProjectsAndGroupsAccess(ctx context.Context, req *logical.Request, client *gitlab.Client, userToken string) (access []string, err error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++	var noneAccessLevels []string
++	minAccessLevel := int(accessLevelNameToValue[config.MinAccessLevel])
++	lastCursorProjects := ""
++	nextPageProjects := true
++	lastCursorGroups := ""
++	nextPageGroups := true
++	graphQLClient := graphql.NewClient(fmt.Sprintf("%s://%s/api/graphql", client.BaseURL().Scheme, client.BaseURL().Host), http.DefaultClient).WithRequestModifier(func(r *http.Request) {
++		r.Header.Set("Authorization", "Bearer "+userToken)
++	})
++
++	for nextPageProjects || nextPageGroups {
++		var query graphQLProjectsGroups
++		variables := map[string]interface{}{
++			"afterProjects": lastCursorProjects,
++			"afterGroups":   lastCursorGroups,
++		}
++		err := graphQLClient.Query(context.Background(), &query, variables)
++		if err != nil {
++			b.Logger().Error("Something went wrong while getting query " + err.Error())
++			break
++		}
++
++		// parse GraphQL groups and projects response
++		if nextPageProjects {
++			var tmpMaxRights []string
++
++			nextPageProjects = query.Projects.PageInfo.HasNextPage
++			tmpMaxRights, _, lastCursorProjects = b.parseGraphQLEdgesToMaxRights(query.Projects.Edges, minAccessLevel)
++			access = append(access, tmpMaxRights...)
++		}
++		// we can only get group direct membership, so we keep "none" access groups
++		if nextPageGroups {
++			var tmpMaxRights, tmpNone []string
++
++			nextPageGroups = query.Groups.PageInfo.HasNextPage
++			tmpMaxRights, tmpNone, lastCursorGroups = b.parseGraphQLEdgesToMaxRights(query.Groups.Edges, minAccessLevel)
++			access = append(access, tmpMaxRights...)
++			noneAccessLevels = append(noneAccessLevels, tmpNone...)
++		}
++
++	}
++	// parse "none" access groups to their MaxAccess according to root groups
++	access = append(access, b.parseNoneAccessLevelsToMaxRights(access, noneAccessLevels)...)
++	// parse all rights access inheritance (E.g: owner = owner + maintainer + dev + guest)
++	access = b.parseMaxRightsToRights(access)
++	return access, nil
++}
++
++// parseGraphQLEdgesToMaxRights parses GraphQL results to MaxAccess rights, also returns "none" access levels
++func (b *backend) parseGraphQLEdgesToMaxRights(edges []graphQLEdge, minAccessLevel int) (rights []string, nonAccessLevels []string, lastCursor string) {
++	for _, e := range edges {
++		accessLevelInt := int(e.Node.MaxAccessLevel.IntegerValue)
++		if accessLevelInt >= minAccessLevel && accessLevelInt > 0 {
++			rights = append(rights, fmt.Sprintf("%s:%s", strings.ReplaceAll(strings.ReplaceAll(e.Node.FullPath, "/", ":"), "-", "_"), b.AccessLevelValueToString(e.Node.MaxAccessLevel.IntegerValue)))
++		}
++		if accessLevelInt == 0 {
++			nonAccessLevels = append(nonAccessLevels, strings.ReplaceAll(strings.ReplaceAll(e.Node.FullPath, "/", ":"), "-", "_"))
++		}
++		lastCursor = e.Cursor
++	}
++	return
++}
++
++// parseNoneAccessLevelsToMaxRights parses "none" access level rights to MaxAccess rights if user has inherited rights
++func (b *backend) parseNoneAccessLevelsToMaxRights(access, noneAccess []string) (rights []string) {
++	for _, value := range noneAccess {
++		for _, aValue := range access {
++			splitAValue := strings.Split(aValue, ":")
++			aValueWithoutAccess, _ := strings.CutSuffix(aValue, ":"+splitAValue[len(splitAValue)-1]) // remove last :access
++			if strings.HasPrefix(value, aValueWithoutAccess) {
++				rights = append(rights, fmt.Sprintf("%s:%s", value, splitAValue[len(splitAValue)-1]))
++				break // only has one per group / project
++			}
++		}
++	}
++	return
++}
++
++// parseMaxRightsToRights parses MaxAccess rights to all rights
++func (b *backend) parseMaxRightsToRights(maxRights []string) (rights []string) {
++	for _, r := range maxRights {
++		rSplit := strings.Split(r, ":")
++		rWithoutAccess, _ := strings.CutSuffix(r, ":"+rSplit[len(rSplit)-1]) // remove last :access
++		for _, level := range b.AllAccessValuesFromLevel(rSplit[len(rSplit)-1]) {
++			rights = append(rights, fmt.Sprintf("%s:%s", rWithoutAccess, level))
++		}
++	}
++	return
++}
++
++type verifyCredentialsResp struct {
++	Username string
++	Rights   []string
++	IsAdmin  bool
++}
++
++type graphQLProjectsGroups struct {
++	Projects struct {
++		PageInfo struct {
++			HasNextPage bool `json:"hasNextPage"`
++		} `json:"pageInfo"`
++		Edges []graphQLEdge
++	} `graphql:"projects(membership:true,after:$afterProjects)"`
++	Groups struct {
++		PageInfo struct {
++			HasNextPage bool `json:"hasNextPage"`
++		} `json:"pageInfo"`
++		Edges []graphQLEdge
++	} `graphql:"groups(after:$afterGroups)"`
++}
++
++type graphQLEdge struct {
++	Cursor string
++	Node   struct {
++		FullPath       string `json:"fullPath"`
++		MaxAccessLevel struct {
++			IntegerValue gitlab.AccessLevelValue `json:"integerValue"`
++		} `json:"maxAccessLevel"`
++	}
++}
+diff --git a/builtin/credential/gitlab/path_login_job.go b/builtin/credential/gitlab/path_login_job.go
+new file mode 100644
+index 0000000000..16727802ea
+--- /dev/null
++++ b/builtin/credential/gitlab/path_login_job.go
+@@ -0,0 +1,139 @@
++package gitlab
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"github.com/hashicorp/go-cleanhttp"
++	"github.com/hashicorp/vault/sdk/framework"
++	"github.com/hashicorp/vault/sdk/logical"
++	"github.com/xanzy/go-gitlab"
++	"io"
++	"net/http"
++	"net/url"
++	"time"
++)
++
++func pathLoginJob(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: `ci`,
++		Fields: map[string]*framework.FieldSchema{
++			"token": {Type: framework.TypeString, Description: "Gitlab Job token"},
++		},
++		Operations: map[logical.Operation]framework.OperationHandler{
++			logical.UpdateOperation: &framework.PathOperation{
++				Callback: b.pathLoginByJob,
++				Responses: map[int][]framework.Response{
++					http.StatusOK: {{
++						Description: http.StatusText(http.StatusOK),
++					}},
++				},
++			},
++		},
++	}
++}
++
++func (b *backend) pathLoginByJob(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++
++	if config.CIToken == "" {
++		return nil, fmt.Errorf("config CI access disabled")
++	}
++
++	// Get Job
++	job, err := b.getJobByToken(config, data.Get("token").(string))
++	if err != nil {
++		return nil, err
++	}
++
++	// Admin client
++	client, err := b.TokenClient(config.BaseURL, config.CIToken)
++	if err != nil {
++		return nil, err
++	}
++
++	// Generate impersonation token for this user
++	name := "vault-connexion"
++	scopes := []string{"read_api"}
++	expTime := time.Now().Add(time.Hour * 24)
++	token, _, err := client.Users.CreateImpersonationToken(job.User.ID, &gitlab.CreateImpersonationTokenOptions{
++		Name:      &name,
++		Scopes:    &scopes,
++		ExpiresAt: &expTime,
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	// Get rights
++	userClient, err := b.TokenClient(config.BaseURL, token.Token)
++	if err != nil {
++		return nil, err
++	}
++
++	user, _, err := userClient.Users.CurrentUser()
++	if err != nil {
++		return nil, err
++	}
++
++	access, err := b.getProjectsAndGroupsAccess(ctx, req, userClient, token.Token)
++	if err != nil {
++		return nil, err
++	}
++
++	// Revoke impersonation
++	_, err = client.Users.RevokeImpersonationToken(job.User.ID, token.ID)
++	if err != nil {
++		return nil, err
++	}
++
++	// Finalize connection
++	if verifyResponse, err := b.parseAdminRights(user.Username, user.IsAdmin, access); err != nil {
++		return nil, err
++	} else {
++		return b.pathLoginOk(verifyResponse, map[string]interface{}{"token": data.Get("token").(string)}), nil
++	}
++}
++
++func (b *backend) getJobByToken(config *config, jobToken string) (job gitlab.Job, err error) {
++	// Verify that job is running, and user id.
++	u, err := url.Parse(fmt.Sprintf("%s/api/v4/job", config.BaseURL))
++	if err != nil {
++		return
++	}
++
++	headers := make(http.Header)
++	headers.Add("JOB-TOKEN", jobToken)
++
++	resp, err := cleanhttp.DefaultClient().Do(&http.Request{
++		Method:     "GET",
++		URL:        u,
++		Proto:      "HTTP/1.1",
++		ProtoMajor: 1,
++		ProtoMinor: 1,
++		Header:     headers,
++		Host:       u.Host,
++	})
++	if err != nil {
++		return
++	}
++	if resp.StatusCode != http.StatusOK {
++		err = errors.New(resp.Status)
++		return
++	}
++
++	data2, _ := io.ReadAll(resp.Body)
++	_ = json.Unmarshal(data2, &job)
++
++	if job.Status != "running" {
++		err = errors.New("job is not running anymore ; could not generate token")
++		return
++	}
++
++	return
++}
+diff --git a/builtin/credential/gitlab/path_login_oauth.go b/builtin/credential/gitlab/path_login_oauth.go
+new file mode 100644
+index 0000000000..262d0f7872
+--- /dev/null
++++ b/builtin/credential/gitlab/path_login_oauth.go
+@@ -0,0 +1,209 @@
++package gitlab
++
++import (
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/rand"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"github.com/hashicorp/vault/sdk/framework"
++	"github.com/hashicorp/vault/sdk/logical"
++	"github.com/xanzy/go-gitlab"
++	"golang.org/x/oauth2"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"time"
++)
++
++func pathOauthLogin(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: `oauth`,
++		Fields: map[string]*framework.FieldSchema{
++			"code":  {Type: framework.TypeString, Description: "Gitlab API code"},
++			"state": {Type: framework.TypeString, Description: "Gitlab API state", Default: ""},
++		},
++
++		Operations: map[logical.Operation]framework.OperationHandler{
++			logical.UpdateOperation: &framework.PathOperation{
++				Callback: b.pathOauthLogin,
++				Responses: map[int][]framework.Response{
++					http.StatusOK: {{
++						Description: http.StatusText(http.StatusOK),
++					}},
++				},
++			},
++			logical.ReadOperation: &framework.PathOperation{
++				Callback: b.pathOauthLogin,
++				Responses: map[int][]framework.Response{
++					http.StatusOK: {{
++						Description: http.StatusText(http.StatusOK),
++					}},
++				},
++			},
++		},
++	}
++}
++
++func (b *backend) pathOauthLogin(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++
++	if config.AppSecret == "" || config.AppID == "" || config.CallbackURL == "" {
++		return nil, fmt.Errorf("config OAuth disabled")
++	}
++
++	baseURL, _ := url.Parse(config.BaseURL)
++	callbackURL, _ := url.Parse(config.CallbackURL)
++
++	oauth2Conf := &oauth2.Config{
++		ClientID:     config.AppID,
++		ClientSecret: config.AppSecret,
++		Endpoint: oauth2.Endpoint{
++			AuthURL:  fmt.Sprintf("%s://%s/oauth/authorize", baseURL.Scheme, baseURL.Host),
++			TokenURL: fmt.Sprintf("%s://%s/oauth/token", baseURL.Scheme, baseURL.Host),
++		},
++		Scopes:      []string{"api", "read_user"},
++		RedirectURL: fmt.Sprintf("%s://%s/v1/%s%s", callbackURL.Scheme, callbackURL.Host, req.MountPoint, req.Path),
++	}
++
++	code, _ := data.GetOk("code")
++
++	if code != nil {
++		state := data.Get("state")
++		err = b.CheckState(state.(string))
++		if err != nil {
++			return nil, err
++		}
++
++		token, err := oauth2Conf.Exchange(ctx, code.(string))
++		if err != nil {
++			return nil, err
++		}
++		client, err := b.TokenClient(config.BaseURL, "OAuth-"+token.AccessToken)
++		if err != nil {
++			return nil, err
++		}
++
++		user, _, err := client.Users.CurrentUser()
++		if err != nil {
++			return nil, err
++		}
++
++		// Admin client
++		adminClient, err := b.TokenClient(config.BaseURL, config.CIToken)
++		if err != nil {
++			return nil, err
++		}
++
++		// Generate impersonation token for this user
++		name := "vault-connexion"
++		scopes := []string{"read_api"}
++		expTime := time.Now().Add(time.Hour * 24)
++		userToken, _, err := adminClient.Users.CreateImpersonationToken(user.ID, &gitlab.CreateImpersonationTokenOptions{
++			Name:      &name,
++			Scopes:    &scopes,
++			ExpiresAt: &expTime,
++		})
++		if err != nil {
++			return nil, err
++		}
++
++		access, err := b.getProjectsAndGroupsAccess(ctx, req, client, userToken.Token)
++		if err != nil {
++			b.Logger().Error("ERROR : ", err.Error())
++			return nil, err
++		}
++
++		// Revoke impersonation
++		_, err = adminClient.Users.RevokeImpersonationToken(user.ID, userToken.ID)
++		if err != nil {
++			return nil, err
++		}
++
++		if verifyResponse, err := b.parseAdminRights(user.Username, user.IsAdmin, access); err != nil {
++			return nil, err
++		} else {
++			response := b.pathLoginOk(verifyResponse, map[string]interface{}{
++				"token": token.AccessToken,
++			})
++			wrappedResponse, err := b.System().ResponseWrapData(ctx, map[string]interface{}{
++				"authType": "gitlab",
++				"token":    "OAuth-" + token.AccessToken,
++			}, time.Second*60, false)
++			if err != nil {
++				return nil, err
++			}
++			response.Redirect = "/ui/vault/auth?with=gitlab&wrapped_token=" + wrappedResponse.Token
++			return response, nil
++		}
++	} else {
++		state, err := b.State()
++		if err != nil {
++			return nil, err
++		}
++		return &logical.Response{
++			Redirect: oauth2Conf.AuthCodeURL(state, oauth2.AccessTypeOffline),
++		}, nil
++	}
++}
++
++func (b *backend) State() (encoded string, err error) {
++	plainText := []byte(strconv.FormatInt(time.Now().UnixNano(), 10))
++
++	block, err := aes.NewCipher(b.CipherKey)
++	if err != nil {
++		return
++	}
++
++	//IV needs to be unique, but doesn't have to be secure.
++	//It's common to put it at the beginning of the ciphertext.
++	cipherText := make([]byte, aes.BlockSize+len(plainText))
++	iv := cipherText[:aes.BlockSize]
++	if _, err = io.ReadFull(rand.Reader, iv); err != nil {
++		return
++	}
++
++	stream := cipher.NewCFBEncrypter(block, iv)
++	stream.XORKeyStream(cipherText[aes.BlockSize:], plainText)
++
++	//returns to base64 encoded string
++	encoded = base64.URLEncoding.EncodeToString(cipherText)
++	return
++}
++
++func (b *backend) CheckState(secureState string) (err error) {
++	now := time.Now().UnixNano()
++	cipherText, err := base64.URLEncoding.DecodeString(secureState)
++	if err != nil {
++		return
++	}
++
++	block, err := aes.NewCipher(b.CipherKey)
++	if err != nil {
++		return
++	}
++
++	if len(cipherText) < aes.BlockSize {
++		err = errors.New("illegal State")
++		return
++	}
++
++	iv := cipherText[:aes.BlockSize]
++	cipherText = cipherText[aes.BlockSize:]
++
++	stream := cipher.NewCFBDecrypter(block, iv)
++	// XORKeyStream can work in-place if the two arguments are the same.
++	stream.XORKeyStream(cipherText, cipherText)
++
++	decoded, err := strconv.ParseInt(string(cipherText), 10, 64)
++	if err == nil && (decoded > now || now-decoded > 60*int64(time.Second)) {
++		err = errors.New("illegal State")
++	}
++	return
++}
+diff --git a/builtin/credential/gitlab/path_login_tokn.go b/builtin/credential/gitlab/path_login_tokn.go
+new file mode 100644
+index 0000000000..b7c24d82be
+--- /dev/null
++++ b/builtin/credential/gitlab/path_login_tokn.go
+@@ -0,0 +1,85 @@
++package gitlab
++
++import (
++	"context"
++	"github.com/hashicorp/vault/sdk/framework"
++	"github.com/hashicorp/vault/sdk/logical"
++	"github.com/xanzy/go-gitlab"
++	"net/http"
++	"time"
++)
++
++func pathLoginToken(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: `login`,
++		Fields: map[string]*framework.FieldSchema{
++			"token": {Type: framework.TypeString, Description: "Gitlab API token"},
++		},
++
++		Operations: map[logical.Operation]framework.OperationHandler{
++			logical.UpdateOperation: &framework.PathOperation{
++				Callback: b.pathLoginByToken,
++				Responses: map[int][]framework.Response{
++					http.StatusOK: {{
++						Description: http.StatusText(http.StatusOK),
++					}},
++				},
++			},
++		},
++	}
++}
++
++func (b *backend) pathLoginByToken(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
++	config, err := b.Config(ctx, req.Storage)
++	if err != nil {
++		return nil, err
++	}
++
++	client, err := b.TokenClient(config.BaseURL, data.Get("token").(string))
++	if err != nil {
++		return nil, err
++	}
++
++	user, _, err := client.Users.CurrentUser()
++	if err != nil {
++		return nil, err
++	}
++
++	// Admin client
++	adminClient, err := b.TokenClient(config.BaseURL, config.CIToken)
++	if err != nil {
++		return nil, err
++	}
++
++	// Generate impersonation token for this user
++	name := "vault-connexion"
++	scopes := []string{"read_api"}
++	expTime := time.Now().Add(time.Hour * 24)
++	userToken, _, err := adminClient.Users.CreateImpersonationToken(user.ID, &gitlab.CreateImpersonationTokenOptions{
++		Name:      &name,
++		Scopes:    &scopes,
++		ExpiresAt: &expTime,
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	access, err := b.getProjectsAndGroupsAccess(ctx, req, client, userToken.Token)
++	if err != nil {
++		return nil, err
++	}
++
++	// Revoke impersonation
++	_, err = adminClient.Users.RevokeImpersonationToken(user.ID, userToken.ID)
++	if err != nil {
++		return nil, err
++	}
++
++	if verifyResponse, err := b.parseAdminRights(user.Username, user.IsAdmin, access); err != nil {
++		return nil, err
++	} else {
++		return b.pathLoginOk(verifyResponse, map[string]interface{}{
++			"token": data.Get("token").(string),
++		}), nil
++	}
++}
+diff --git a/command/base_predict.go b/command/base_predict.go
+index 72ba402fe9..96cd3d73df 100644
+--- a/command/base_predict.go
++++ b/command/base_predict.go
+@@ -110,6 +110,7 @@ func (b *BaseCommand) PredictVaultAvailableAuths() complete.Predictor {
+ 		"cert",
+ 		"gcp",
+ 		"github",
++		"gitlab",
+ 		"ldap",
+ 		"okta",
+ 		"plugin",
+diff --git a/command/base_predict_test.go b/command/base_predict_test.go
+index 2d752ed635..4257aef973 100644
+--- a/command/base_predict_test.go
++++ b/command/base_predict_test.go
+@@ -359,6 +359,7 @@ func TestPredict_Plugins(t *testing.T) {
+ 				"gcp",
+ 				"gcpkms",
+ 				"github",
++				"gitlab",
+ 				"hana-database-plugin",
+ 				"influxdb-database-plugin",
+ 				"jwt",
+diff --git a/command/commands.go b/command/commands.go
+index 3579a70356..155a5c32af 100644
+--- a/command/commands.go
++++ b/command/commands.go
+@@ -36,6 +36,7 @@ import (
+ 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
+ 	credCert "github.com/hashicorp/vault/builtin/credential/cert"
+ 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
+ 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
+ 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
+ 	credToken "github.com/hashicorp/vault/builtin/credential/token"
+@@ -228,6 +229,7 @@ var (
+ 		"cf":       &credCF.CLIHandler{},
+ 		"gcp":      &credGcp.CLIHandler{},
+ 		"github":   &credGitHub.CLIHandler{},
++		"gitlab":   &credGitlab.CLIHandler{},
+ 		"kerberos": &credKerb.CLIHandler{},
+ 		"ldap":     &credLdap.CLIHandler{},
+ 		"oci":      &credOCI.CLIHandler{},
+diff --git a/go.mod b/go.mod
+index 8e1de83f6d..fbd7b656bc 100644
+--- a/go.mod
++++ b/go.mod
+@@ -232,7 +232,7 @@ require (
+ 	k8s.io/apimachinery v0.29.1
+ 	k8s.io/utils v0.0.0-20230726121419-3b25d923346b
+ 	layeh.com/radius v0.0.0-20231213012653-1006025d24f8
+-	nhooyr.io/websocket v1.8.7
++	nhooyr.io/websocket v1.8.10
+ )
+
+ require (
+diff --git a/go.sum b/go.sum
+index b0cc8032fb..c1ad37a7d5 100644
+--- a/go.sum
++++ b/go.sum
+@@ -1930,10 +1930,6 @@ github.com/ghodss/yaml v0.0.0-20150909031657-73d445a93680/go.mod h1:4dBDuWmgqj2H
+ github.com/ghodss/yaml v1.0.0/go.mod h1:4dBDuWmgqj2HViK6kFavaiC9ZROes6MMH2rRYeMEF04=
+ github.com/ghodss/yaml v1.0.1-0.20190212211648-25d852aebe32 h1:Mn26/9ZMNWSw9C9ERFA1PUxfmGpolnw2v0bKOREu5ew=
+ github.com/ghodss/yaml v1.0.1-0.20190212211648-25d852aebe32/go.mod h1:GIjDIg/heH5DOkXY3YJ/wNhfHsQHoXGjl8G8amsYQ1I=
+-github.com/gin-contrib/sse v0.1.0 h1:Y/yl/+YNO8GZSjAhjMsSuLt29uWRFHdHYUb5lYOV9qE=
+-github.com/gin-contrib/sse v0.1.0/go.mod h1:RHrZQHXnP2xjPF+u1gW/2HnVO7nvIa9PG3Gm+fLHvGI=
+-github.com/gin-gonic/gin v1.6.3 h1:ahKqKTFpO5KTPHxWZjEdPScmYaGtLo8Y4DMHoEsnp14=
+-github.com/gin-gonic/gin v1.6.3/go.mod h1:75u5sXoLsGZoRN5Sgbi1eraJ4GU3++wFwWzhwvtwp4M=
+ github.com/gliderlabs/ssh v0.3.5 h1:OcaySEmAQJgyYcArR+gGGTHCyE7nvhEMTlYY+Dp8CpY=
+ github.com/gliderlabs/ssh v0.3.5/go.mod h1:8XB4KraRrX39qHhT6yxPsHedjA08I/uBVwj4xC+/+z4=
+ github.com/go-asn1-ber/asn1-ber v1.3.1/go.mod h1:hEBeB/ic+5LoWskz+yKT7vGhhPYkProFKoKdwZRWMe0=
+@@ -2046,13 +2042,6 @@ github.com/go-ozzo/ozzo-validation v3.6.0+incompatible h1:msy24VGS42fKO9K1vLz82/
+ github.com/go-ozzo/ozzo-validation v3.6.0+incompatible/go.mod h1:gsEKFIVnabGBt6mXmxK0MoFy+cZoTJY6mu5Ll3LVLBU=
+ github.com/go-pdf/fpdf v0.5.0/go.mod h1:HzcnA+A23uwogo0tp9yU+l3V+KXhiESpt1PMayhOh5M=
+ github.com/go-pdf/fpdf v0.6.0/go.mod h1:HzcnA+A23uwogo0tp9yU+l3V+KXhiESpt1PMayhOh5M=
+-github.com/go-playground/assert/v2 v2.0.1/go.mod h1:VDjEfimB/XKnb+ZQfWdccd7VUvScMdVu0Titje2rxJ4=
+-github.com/go-playground/locales v0.13.0 h1:HyWk6mgj5qFqCT5fjGBuRArbVDfE4hi8+e8ceBS/t7Q=
+-github.com/go-playground/locales v0.13.0/go.mod h1:taPMhCMXrRLJO55olJkUXHZBHCxTMfnGwq/HNwmWNS8=
+-github.com/go-playground/universal-translator v0.17.0 h1:icxd5fm+REJzpZx7ZfpaD876Lmtgy7VtROAbHHXk8no=
+-github.com/go-playground/universal-translator v0.17.0/go.mod h1:UkSxE5sNxxRwHyU+Scu5vgOQjsIJAF8j9muTVoKLVtA=
+-github.com/go-playground/validator/v10 v10.2.0 h1:KgJ0snyC2R9VXYN2rneOtQcw5aHQB1Vv0sFl1UcHBOY=
+-github.com/go-playground/validator/v10 v10.2.0/go.mod h1:uOYAAleCW8F/7oMFd6aG0GOhaH6EGOAJShg8Id5JGkI=
+ github.com/go-sql-driver/mysql v1.5.0/go.mod h1:DCzpHaOWr8IXmIStZouvnhqoel9Qv2LBy8hT2VhHyBg=
+ github.com/go-sql-driver/mysql v1.6.0/go.mod h1:DCzpHaOWr8IXmIStZouvnhqoel9Qv2LBy8hT2VhHyBg=
+ github.com/go-sql-driver/mysql v1.7.1 h1:lUIinVbN1DY0xBg0eMOzmmtGoHwWBbvnWubQUrtU8EI=
+@@ -2068,12 +2057,6 @@ github.com/go-test/deep v1.1.0/go.mod h1:5C2ZWiW0ErCdrYzpqxLbTX7MG14M9iiw8DgHncV
+ github.com/go-zookeeper/zk v1.0.3 h1:7M2kwOsc//9VeeFiPtf+uSJlVpU66x9Ba5+8XK7/TDg=
+ github.com/go-zookeeper/zk v1.0.3/go.mod h1:nOB03cncLtlp4t+UAkGSV+9beXP/akpekBwL+UX1Qcw=
+ github.com/gobwas/glob v0.2.3/go.mod h1:d3Ez4x06l9bZtSvzIay5+Yzi0fmZzPgnTbPcKjJAkT8=
+-github.com/gobwas/httphead v0.0.0-20180130184737-2c6c146eadee h1:s+21KNqlpePfkah2I+gwHF8xmJWRjooY+5248k6m4A0=
+-github.com/gobwas/httphead v0.0.0-20180130184737-2c6c146eadee/go.mod h1:L0fX3K22YWvt/FAX9NnzrNzcI4wNYi9Yku4O0LKYflo=
+-github.com/gobwas/pool v0.2.0 h1:QEmUOlnSjWtnpRGHF3SauEiOsy82Cup83Vf2LcMlnc8=
+-github.com/gobwas/pool v0.2.0/go.mod h1:q8bcK0KcYlCgd9e7WYLm9LpyS+YeLd8JVDW6WezmKEw=
+-github.com/gobwas/ws v1.0.2 h1:CoAavW/wd/kulfZmSIBt6p24n4j7tHgNVCjsfHVNUbo=
+-github.com/gobwas/ws v1.0.2/go.mod h1:szmBTxLgaFppYjEmNtny/v3w89xOydFnnZMcgRRu/EM=
+ github.com/goccy/go-json v0.9.7/go.mod h1:6MelG93GURQebXPDq3khkgXZkazVtN9CRI+MGFi0w8I=
+ github.com/goccy/go-json v0.9.11/go.mod h1:6MelG93GURQebXPDq3khkgXZkazVtN9CRI+MGFi0w8I=
+ github.com/goccy/go-json v0.10.2 h1:CrxCmQqYDkv1z7lO7Wbh2HN93uovUHgrECaO5ZrCXAU=
+@@ -2301,7 +2284,6 @@ github.com/gorilla/sessions v1.2.1 h1:DHd3rPN5lE3Ts3D8rKkQ8x/0kqfeNmBAaiSi+o7Fsg
+ github.com/gorilla/sessions v1.2.1/go.mod h1:dk2InVEVJ0sfLlnXv9EAgkf6ecYs/i80K/zI+bUmuGM=
+ github.com/gorilla/websocket v0.0.0-20170926233335-4201258b820c/go.mod h1:E7qHFY5m1UJ88s3WnNqhKjPHQ0heANvMoAMk2YaljkQ=
+ github.com/gorilla/websocket v1.4.0/go.mod h1:E7qHFY5m1UJ88s3WnNqhKjPHQ0heANvMoAMk2YaljkQ=
+-github.com/gorilla/websocket v1.4.1/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+ github.com/gorilla/websocket v1.4.2/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+ github.com/gorilla/websocket v1.5.1 h1:gmztn0JnHVt9JZquRuzLw3g4wouNVzKL15iLr/zn/QY=
+ github.com/gorilla/websocket v1.5.1/go.mod h1:x3kM2JMyaluk02fnUJpQuwD2dCS5NDG2ZHL0uE0tcaY=
+@@ -2749,7 +2731,6 @@ github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI
+ github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
+ github.com/klauspost/asmfmt v1.3.2/go.mod h1:AG8TuvYojzulgDAMCnYn50l/5QV3Bs/tp6j0HLHbNSE=
+ github.com/klauspost/compress v1.4.1/go.mod h1:RyIbtBH6LamlWaDj8nUwkbUhJ87Yi3uG0guNDohfE1A=
+-github.com/klauspost/compress v1.10.3/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
+ github.com/klauspost/compress v1.11.3/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
+ github.com/klauspost/compress v1.11.4/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
+ github.com/klauspost/compress v1.11.13/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
+@@ -2786,8 +2767,6 @@ github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=
+ github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
+ github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
+ github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
+-github.com/leodido/go-urn v1.2.0 h1:hpXL4XnriNwQ/ABnpepYM/1vCLWNDfUNts8dX3xTG6Y=
+-github.com/leodido/go-urn v1.2.0/go.mod h1:+8+nEpDfqqsY+g338gtMEUOtuK+4dEMhiQEgxpxOKII=
+ github.com/lestrrat-go/backoff/v2 v2.0.8/go.mod h1:rHP/q/r9aT27n24JQLa7JhSQZCKBBOiM/uP402WwN8Y=
+ github.com/lestrrat-go/blackmagic v1.0.0/go.mod h1:TNgH//0vYSs8VXDCfkZLgIrVTTXQELZffUV0tz3MtdQ=
+ github.com/lestrrat-go/httpcc v1.0.1/go.mod h1:qiltp3Mt56+55GPVCbTdM9MlqhvzyuL6W/NMDA8vA5E=
+@@ -3400,11 +3379,7 @@ github.com/uber/jaeger-client-go v2.30.0+incompatible/go.mod h1:WVhlPFC8FDjOFMMW
+ github.com/uber/jaeger-lib v2.4.1+incompatible h1:td4jdvLcExb4cBISKIpHuGoVXh+dVKhn2Um6rjCsSsg=
+ github.com/uber/jaeger-lib v2.4.1+incompatible/go.mod h1:ComeNDZlWwrWnDv8aPp0Ba6+uUTzImX/AauajbLI56U=
+ github.com/ugorji/go v1.1.4/go.mod h1:uQMGLiO92mf5W77hV/PUCpI3pbzQx3CRekS0kk+RGrc=
+-github.com/ugorji/go v1.1.7 h1:/68gy2h+1mWMrwZFeD1kQialdSzAb432dtpeJ42ovdo=
+-github.com/ugorji/go v1.1.7/go.mod h1:kZn38zHttfInRq0xu/PH0az30d+z6vm202qpg1oXVMw=
+ github.com/ugorji/go/codec v0.0.0-20181204163529-d75b2dcb6bc8/go.mod h1:VFNgLljTbGfSG7qAOspJ7OScBnGdDN/yBr0sguwnwf0=
+-github.com/ugorji/go/codec v1.1.7 h1:2SvQaVZ1ouYrrKKwoSk2pzd4A9evlKJb9oTL+OaLUSs=
+-github.com/ugorji/go/codec v1.1.7/go.mod h1:Ax+UKWsSmolVDwsd+7N3ZtXu+yMGCf907BLYF3GoBXY=
+ github.com/ulikunitz/xz v0.5.8/go.mod h1:nbz6k7qbPmH4IRqmfOplQw/tblSgqTqBwxkY0oWt/14=
+ github.com/ulikunitz/xz v0.5.9/go.mod h1:nbz6k7qbPmH4IRqmfOplQw/tblSgqTqBwxkY0oWt/14=
+ github.com/ulikunitz/xz v0.5.10 h1:t92gobL9l3HE202wg3rlk19F6X+JOxl9BBrCCMYEYd8=
+@@ -4824,8 +4799,8 @@ modernc.org/token v1.1.0/go.mod h1:UGzOrNV1mAFSEB63lOFHIpNRUVMvYTc6yu1SMY/XTDM=
+ modernc.org/z v1.5.1/go.mod h1:eWFB510QWW5Th9YGZT81s+LwvaAs3Q2yr4sP0rmLkv8=
+ mvdan.cc/gofumpt v0.1.1/go.mod h1:yXG1r1WqZVKWbVRtBWKWX9+CxGYfA51nSomhM0woR48=
+ mvdan.cc/gofumpt v0.2.1/go.mod h1:a/rvZPhsNaedOJBzqRD9omnwVwHZsBdJirXHa9Gh9Ig=
+-nhooyr.io/websocket v1.8.7 h1:usjR2uOr/zjjkVMy0lW+PPohFok7PCow5sDjLgX4P4g=
+-nhooyr.io/websocket v1.8.7/go.mod h1:B70DZP8IakI65RVQ51MsWP/8jndNma26DVA/nFSCgW0=
++nhooyr.io/websocket v1.8.10 h1:mv4p+MnGrLDcPlBoWsvPP7XCzTYMXP9F9eIGoKbgx7Q=
++nhooyr.io/websocket v1.8.10/go.mod h1:rN9OFWIUwuxg4fR5tELlYC04bXYowCP9GX47ivo2l+c=
+ oras.land/oras-go v1.2.0/go.mod h1:pFNs7oHp2dYsYMSS82HaX5l4mpnGO7hbpPN6EWH2ltc=
+ rsc.io/binaryregexp v0.2.0/go.mod h1:qTv7/COck+e2FymRvadv62gMdZztPaShugOCi3I+8D8=
+ rsc.io/pdf v0.1.1/go.mod h1:n8OzWcQ6Sp37PL01nO98y4iUCRdTGarVfzxY20ICaU4=
+diff --git a/helper/builtinplugins/registry.go b/helper/builtinplugins/registry.go
+index d4c1146995..aa71ea6994 100644
+--- a/helper/builtinplugins/registry.go
++++ b/helper/builtinplugins/registry.go
+@@ -5,7 +5,6 @@ package builtinplugins
+
+ import (
+ 	"context"
+-
+ 	credAliCloud "github.com/hashicorp/vault-plugin-auth-alicloud"
+ 	credAzure "github.com/hashicorp/vault-plugin-auth-azure"
+ 	credCentrify "github.com/hashicorp/vault-plugin-auth-centrify"
+@@ -35,6 +34,7 @@ import (
+ 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
+ 	credCert "github.com/hashicorp/vault/builtin/credential/cert"
+ 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
+ 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
+ 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
+ 	credRadius "github.com/hashicorp/vault/builtin/credential/radius"
+@@ -115,6 +115,7 @@ func newRegistry() *registry {
+ 			"cf":         {Factory: credCF.Factory},
+ 			"gcp":        {Factory: credGcp.Factory},
+ 			"github":     {Factory: credGitHub.Factory},
++			"gitlab":     {Factory: credGitlab.Factory},
+ 			"jwt":        {Factory: credJWT.Factory},
+ 			"kerberos":   {Factory: credKerb.Factory},
+ 			"kubernetes": {Factory: credKube.Factory},
+diff --git a/ui/app/adapters/auth-config/gitlab.js b/ui/app/adapters/auth-config/gitlab.js
+new file mode 100644
+index 0000000000..21f5624ac4
+--- /dev/null
++++ b/ui/app/adapters/auth-config/gitlab.js
+@@ -0,0 +1,2 @@
++import AuthConfig from './_base';
++export default AuthConfig.extend();
+diff --git a/ui/app/adapters/cluster.js b/ui/app/adapters/cluster.js
+index 7469e062cd..fa6c055922 100644
+--- a/ui/app/adapters/cluster.js
++++ b/ui/app/adapters/cluster.js
+@@ -175,6 +175,7 @@ export default ApplicationAdapter.extend({
+     const authURLs = {
+       github: 'login',
+       jwt: 'login',
++      gitlab: username ? `login/${encodeURIComponent(username)}` : 'login',
+       oidc: 'login',
+       userpass: `login/${encodeURIComponent(username)}`,
+       ldap: `login/${encodeURIComponent(username)}`,
+diff --git a/ui/app/components/auth-form.js b/ui/app/components/auth-form.js
+index cfb1d3456d..594149d966 100644
+--- a/ui/app/components/auth-form.js
++++ b/ui/app/components/auth-form.js
+@@ -193,8 +193,14 @@ export default Component.extend(DEFAULTS, {
+       this.set('selectedAuth', 'token');
+       const adapter = this.store.adapterFor('tools');
+       try {
+-        const response = yield adapter.toolAction('unwrap', null, { clientToken: token });
+-        this.set('token', response.auth.client_token);
++        const response = yield adapter.toolAction('unwrap', null, {clientToken: token});
++        if (response.data.authType) {
++          this.set('selectedAuth', response.data.authType)
++          this.set('token', response.data.token);
++        } else {
++          this.set('selectedAuth', 'token');
++          this.set('token', response.auth.client_token);
++        }
+         this.send('doSubmit');
+       } catch (e) {
+         this.set('error', `Token unwrap failed: ${e.errors[0]}`);
+diff --git a/ui/app/helpers/mountable-auth-methods.js b/ui/app/helpers/mountable-auth-methods.js
+index 303e9baff4..932df2a012 100644
+--- a/ui/app/helpers/mountable-auth-methods.js
++++ b/ui/app/helpers/mountable-auth-methods.js
+@@ -55,6 +55,13 @@ const MOUNTABLE_AUTH_METHODS = [
+     category: 'cloud',
+     glyph: 'github-color',
+   },
++  {
++    displayName: 'Gitlab',
++    value: 'gitlab',
++    type: 'gitlab',
++    glyph: 'auth',
++    category: 'cloud',
++  },
+   {
+     displayName: 'JWT',
+     value: 'jwt',
+diff --git a/ui/app/helpers/supported-auth-backends.js b/ui/app/helpers/supported-auth-backends.js
+index e06cbd3387..a4e5b7658a 100644
+--- a/ui/app/helpers/supported-auth-backends.js
++++ b/ui/app/helpers/supported-auth-backends.js
+@@ -70,6 +70,14 @@ const SUPPORTED_AUTH_BACKENDS = [
+     displayNamePath: ['metadata.org', 'metadata.username'],
+     formAttributes: ['token'],
+   },
++  {
++    type: 'gitlab',
++    typeDisplay: 'Gitlab',
++    description: 'Gitlab authentication.',
++    tokenPath: 'client_token',
++    displayNamePath: 'metadata.username',
++    formAttributes: ['token'],
++  },
+ ];
+
+ const ENTERPRISE_AUTH_METHODS = [
+diff --git a/ui/app/helpers/tabs-for-auth-section.js b/ui/app/helpers/tabs-for-auth-section.js
+index 46f95fe65a..ce32f2c4f8 100644
+--- a/ui/app/helpers/tabs-for-auth-section.js
++++ b/ui/app/helpers/tabs-for-auth-section.js
+@@ -34,6 +34,12 @@ const TABS_FOR_SETTINGS = {
+       routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
+     },
+   ],
++  gitlab: [
++    {
++      label: 'Configuration',
++      routeParams: ['vault.cluster.settings.auth.configure.section', 'configuration'],
++    },
++  ],
+   gcp: [
+     {
+       label: 'Configuration',
+diff --git a/ui/app/models/auth-config/gitlab.js b/ui/app/models/auth-config/gitlab.js
+new file mode 100644
+index 0000000000..91d52cbcc3
+--- /dev/null
++++ b/ui/app/models/auth-config/gitlab.js
+@@ -0,0 +1,39 @@
++import { computed } from '@ember/object';
++import DS from 'ember-data';
++
++import AuthConfig from '../auth-config';
++import fieldToAttrs from 'vault/utils/field-to-attrs';
++
++const { attr } = DS;
++
++export default AuthConfig.extend({
++    baseURL: attr('string', {
++        label: 'Base URL',
++    }),
++    minAccessLevel: attr('string', {
++        label: 'Minimal Access Level',
++        defaultValue: 'developer',
++        possibleValues: ['none', 'guest', 'reporter', 'developer', 'maintainer', 'owner']
++    }),
++    appID: attr('string', {
++        label: 'Oauth Application ID',
++    }),
++    appSecret: attr('string', {
++        label: 'Oauth Application Secret',
++    }),
++    callbackURL: attr('string', {
++        label: 'Oauth Callback URL',
++    }),
++    ciToken: attr('string', {
++        label: 'CI token',
++    }),
++
++    fieldGroups: computed(function() {
++        const groups = [{
++            'Gitlab Options': ['baseURL', 'minAccessLevel', 'appID', 'appSecret', 'callbackURL', 'ciToken'],
++        }, ];
++
++        return fieldToAttrs(this, groups);
++    }),
++
++});
+diff --git a/ui/app/routes/vault/cluster/settings/auth/configure/section.js b/ui/app/routes/vault/cluster/settings/auth/configure/section.js
+index 0189f28962..f8a22b84d4 100644
+--- a/ui/app/routes/vault/cluster/settings/auth/configure/section.js
++++ b/ui/app/routes/vault/cluster/settings/auth/configure/section.js
+@@ -22,6 +22,7 @@ export default Route.extend(UnloadModelRoute, {
+       'aws-roletag-denylist': 'auth-config/aws/roletag-denylist',
+       'azure-configuration': 'auth-config/azure',
+       'github-configuration': 'auth-config/github',
++      'gitlab-configuration': 'auth-config/gitlab',
+       'gcp-configuration': 'auth-config/gcp',
+       'jwt-configuration': 'auth-config/jwt',
+       'oidc-configuration': 'auth-config/oidc',
+diff --git a/ui/app/templates/components/auth-form.hbs b/ui/app/templates/components/auth-form.hbs
+index cb56335804..d1ff88ad74 100644
+--- a/ui/app/templates/components/auth-form.hbs
++++ b/ui/app/templates/components/auth-form.hbs
+@@ -128,6 +128,19 @@
+                 />
+               </div>
+             </div>
++          {{else if (eq this.providerName "gitlab")}}
++            <div class="field">
++              <a href="/v1/auth/gitlab/oauth">
++                <button type="button" class="button is-primary {{if this.authenticate.isRunning 'is-loading'}} auto-width" id="oauth2-submit" disabled={{this.authenticate.isRunning}}>
++                  OAuth2 Sign In
++                </button>
++              </a>
++              <hr>
++              <label for="token" class="is-label">Or, login via a Gitlab token:</label>
++              <div class="control">
++                <Input @type="password" @value={{this.token}} @name="token" @id="token" class="input" data-test-token={{true}} @autocomplete="off" @spellcheck="false" />
++              </div>
++            </div>
+           {{else if (eq this.providerName "token")}}
+             <div class="field">
+               <label for="token" class="is-label">Token</label>
+diff --git a/ui/app/templates/components/wizard/gitlab-method.hbs b/ui/app/templates/components/wizard/gitlab-method.hbs
+new file mode 100644
+index 0000000000..f3d95a1762
+--- /dev/null
++++ b/ui/app/templates/components/wizard/gitlab-method.hbs
+@@ -0,0 +1,10 @@
++<WizardSection
++  @headerText="Gitlab"
++  @headerIcon="enable/gitlab"
++  @docText="Docs: Gitlab Authentication"
++  @docPath="/docs/auth/gitlab.html"
++>
++  <p>
++    The Gitlab auth method can be used to authenticate with Vault using a Gitlab access token.
++  </p>
++</WizardSection>
+diff --git a/ui/public/eco/gitlab.svg b/ui/public/eco/gitlab.svg
+new file mode 100644
+index 0000000000..95a22f1017
+--- /dev/null
++++ b/ui/public/eco/gitlab.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 380 380"><defs><style>.cls-1{fill:#e24329;}.cls-2{fill:#fc6d26;}.cls-3{fill:#fca326;}</style></defs><g id="LOGO"><path class="cls-1" d="M282.83,170.73l-.27-.69-26.14-68.22a6.81,6.81,0,0,0-2.69-3.24,7,7,0,0,0-8,.43,7,7,0,0,0-2.32,3.52l-17.65,54H154.29l-17.65-54A6.86,6.86,0,0,0,134.32,99a7,7,0,0,0-8-.43,6.87,6.87,0,0,0-2.69,3.24L97.44,170l-.26.69a48.54,48.54,0,0,0,16.1,56.1l.09.07.24.17,39.82,29.82,19.7,14.91,12,9.06a8.07,8.07,0,0,0,9.76,0l12-9.06,19.7-14.91,40.06-30,.1-.08A48.56,48.56,0,0,0,282.83,170.73Z"/><path class="cls-2" d="M282.83,170.73l-.27-.69a88.3,88.3,0,0,0-35.15,15.8L190,229.25c19.55,14.79,36.57,27.64,36.57,27.64l40.06-30,.1-.08A48.56,48.56,0,0,0,282.83,170.73Z"/><path class="cls-3" d="M153.43,256.89l19.7,14.91,12,9.06a8.07,8.07,0,0,0,9.76,0l12-9.06,19.7-14.91S209.55,244,190,229.25C170.45,244,153.43,256.89,153.43,256.89Z"/><path class="cls-2" d="M132.58,185.84A88.19,88.19,0,0,0,97.44,170l-.26.69a48.54,48.54,0,0,0,16.1,56.1l.09.07.24.17,39.82,29.82s17-12.85,36.57-27.64Z"/></g></svg>
+\ No newline at end of file
+diff --git a/ui/tests/acceptance/settings/auth/configure/section-test.js b/ui/tests/acceptance/settings/auth/configure/section-test.js
+index e9c0539c3e..a2ea4f29af 100644
+--- a/ui/tests/acceptance/settings/auth/configure/section-test.js
++++ b/ui/tests/acceptance/settings/auth/configure/section-test.js
+@@ -60,7 +60,7 @@ module('Acceptance | settings/auth/configure/section', function (hooks) {
+     assert.ok(keys.includes('description'), 'passes updated description on tune');
+   });
+
+-  for (const type of ['aws', 'azure', 'gcp', 'github', 'kubernetes']) {
++  for (const type of ['aws', 'azure', 'gcp', 'github', 'gitlab', 'kubernetes']) {
+     test(`it shows tabs for auth method: ${type}`, async function (assert) {
+       const path = `${type}-showtab-${this.uid}`;
+       await cli.consoleInput(`write sys/auth/${path} type=${type}`);

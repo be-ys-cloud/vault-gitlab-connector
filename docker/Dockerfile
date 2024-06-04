@@ -1,4 +1,4 @@
-FROM golang:1.21.7-bullseye as build
+FROM golang:1.22-bullseye as build
 
 RUN mkdir /builddir
 WORKDIR /builddir
@@ -8,9 +8,11 @@ RUN apt install -y nodejs bash zip make git
 RUN npm install -g yarn
 ENV XC_OSARCH linux/amd64
 RUN go mod tidy
+RUN go get github.com/dmarkham/enumer
+RUN go install github.com/dmarkham/enumer
 RUN make bootstrap static-dist bin
 
-FROM alpine:3.19 as run
+FROM alpine:3.20 as run
 COPY --from=build /builddir/bin/vault /opt/vault
 COPY docker/configuration.json /opt/configuration.json
 EXPOSE 8200
