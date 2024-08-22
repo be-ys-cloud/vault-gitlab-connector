@@ -1,5 +1,4 @@
 {
-  "log-file": "/opt/data/",
   "storage": {
     "file": {
       "path": "/opt/data/file"
