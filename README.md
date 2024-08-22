@@ -18,12 +18,22 @@ Project which takes [HashiCorp Vault](https://github.com/hashicorp/vault/) sourc
 * For convenience, you will also find a ready-to-go docker file in `docker/` folder. You can build the project
   using `docker build -t customized_vault:latest -f docker/Dockerfile .`
 
+### Run it
+
+**This command is only designed to test your Vault build. DO NOT use this configuration on production!**
+
+`docker run --rm -p 8200:8200 -e VAULT_API_ADDR="http://localhost" --cap-add=IPC_LOCK  customized_vault:latest`
+
 ### How to make a new patch ?
 
 While updating Vault to a new version, we strongly suggest you to start by copying the previous version folder patches
 and use it as a base.
 
 Vault APIs are quite stable, so you (theoretically) will not spend a lot of times on migration.
+
+To patch and ignore errors, you can run `git apply --reject --whitespace=fix ../patches/<DESIRED_VERSION>.patch`. Then
+fix all files that were rejected. Run a `git add . && git commit -m "new version"` in `vault` directory, then
+a `git diff HEAD~1 > ../patches/v<DESIRED_VERSION>.patch` to save the full diff.
 
 _____________
 
