@@ -52,7 +52,9 @@ practices, please refer to
       as this account is not a personal account and thus will never be disabled) ;
     * Go to https://<your_gitlab_instance>/-/profile/personal_access_tokens, and generate a Personal Access Token with (
       at least) the following rights:
+        * `api`
         * `read_api`
+        * `read_user`
         * `sudo`
     * **Caution: Starting Gitlab 16.0, Personal Access Token must have an expiration date. Please, be aware of the
       expiration date of the token, and do the appropriate action to generate a new one before it expires.**
