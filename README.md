@@ -6,7 +6,7 @@ Project which takes [HashiCorp Vault](https://github.com/hashicorp/vault/) sourc
 > Before migration to v1.15.6, don't forget to duplicate all your policies with the new formatted names.  
 > After migration, you'll be able to remove old policies.
 
-> **Please note that the GitLab connector is only available with a full-Vault build starting 1.18.0.
+> **Please note that the GitLab connector is only available with a full-Vault build starting 1.18.0.**
 
 ## Building the image
 
