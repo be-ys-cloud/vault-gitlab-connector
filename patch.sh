@@ -10,10 +10,14 @@ if [ ! -f "patches/$1.patch" ]; then
   exit 1
 fi
 
+ADDITIONAL_ARGS=""
+if [ "$2" = "--dev" ]; then
+  ADDITIONAL_ARGS="--3way --whitespace=fix"
+fi
 
 rm -rf vault/ > /dev/null 2>&1
 
 git clone -b $1 https://github.com/hashicorp/vault.git vault
 cd ./vault
-git apply ../patches/$1.patch
+git apply $ADDITIONAL_ARGS ../patches/$1.patch
 echo "SUCCESS : If not error occurred, source have been patched !"

@@ -6,6 +6,8 @@ Project which takes [HashiCorp Vault](https://github.com/hashicorp/vault/) sourc
 > Before migration to v1.15.6, don't forget to duplicate all your policies with the new formatted names.  
 > After migration, you'll be able to remove old policies.
 
+> **Please note that the GitLab connector is only available with a full-Vault build starting 1.18.0.
+
 ## Building the image
 
 ### How it works
@@ -34,6 +36,9 @@ Vault APIs are quite stable, so you (theoretically) will not spend a lot of time
 To patch and ignore errors, you can run `git apply --reject --whitespace=fix ../patches/<DESIRED_VERSION>.patch`. Then
 fix all files that were rejected. Run a `git add . && git commit -m "new version"` in `vault` directory, then
 a `git diff HEAD~1 > ../patches/v<DESIRED_VERSION>.patch` to save the full diff.
+
+Starting v1.18.0, you can use the `patch.sh` command by adding a `--dev` argument at the end of the command. For
+example: `./patch.sh v1.18.0 --dev`.
 
 _____________
 
