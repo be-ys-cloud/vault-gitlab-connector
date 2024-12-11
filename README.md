@@ -101,6 +101,8 @@ Congratulations, GitLab is now fully configured! Let's move on to the Vault side
     * OAuth callback URL: It should be the root address of your Vault instance.
         * eg: `https://my_vault_server.local`.
     * CI token: put in the previously generated PAT from GitLab.
+    * (*Starting v1.18.1*) (*Optional*) Vault Service Token: an optional Vault service token that will be used to read
+      loaded policies in your Vault . See [VST Configuration](#vault-service-token-configuration) for more details.
 
 Vault is now configured, you should be able to log in to Vault using your GitLab credentials now!
 
@@ -118,6 +120,54 @@ concatenate the user role after it. A few examples to fully understand it:
     * The matching policies will be named `group_one:owner` and `group_two:very:long:pa_th:project:reporter`
 
 Every matching Vault policy will be loaded to the user token.
+
+### Vault Service Token Configuration
+
+Added in v1.18.1 and onwards, the Vault Service Token allows you to filter the generated policies based on your GitLab
+access, by removing any policy that does not really exist in Vault. This feature drastically reduce token size, and also
+your audit logs if you enabled them.
+
+You must provide a token that never expires OR a token that can be renewed indefinitely. The backend will refresh every
+two minutes the list of ACLs registered in Vault, and will also renew the token accordingly. We highly recommend to
+create a dedicated token for this usage with a very specific policy, in order to limit any risk if this token got
+stolen.
+
+Create an ACL policy named `token-viewer`, with the following content:
+
+```hcl
+# Allow people to list all ACLs
+path "sys/policies/acl" {
+  capabilities = ["list"]
+}
+
+# Allow tokens to look up their own properties
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+
+# Allow tokens to renew themselves
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+
+# Allow tokens to revoke themselves
+path "auth/token/revoke-self" {
+  capabilities = ["update"]
+}
+```
+
+This policy is very restrictive, and only allows token to list ACL on Vault (but not see them), and perform basic
+operations on its own token (lookup/renew/revoke).
+
+Then, using a root account, create a new token with this policy only :
+`vault token create -policy="token-viewer" -period=24h -no-default-policy`
+
+This token will have no privileges but the ones you defined in your `token-viewer` policy, ensuring a very limited risk
+for your passwords.
+
+If no Vault Service Token is provided, the program will load all the policies based on your rights.
+
+If you provide a token, please note that **users must have to log-out and login again when privileges changes.**
 
 _____________
 

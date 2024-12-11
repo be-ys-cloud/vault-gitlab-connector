@@ -1431,7 +1431,7 @@ index 8db22350cf..18bb2845b9 100644
  		"ldap":     &credLdap.CLIHandler{},
  		"oci":      &credOCI.CLIHandler{},
 diff --git a/go.mod b/go.mod
-index 3e3bd5e62f..f6e4d98ed6 100644
+index 60d5fddaae..4a5f128e93 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -231,9 +231,11 @@ require (
@@ -1447,7 +1447,7 @@ index 3e3bd5e62f..f6e4d98ed6 100644
  	github.com/moby/docker-image-spec v1.3.1 // indirect
  	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 diff --git a/go.sum b/go.sum
-index 6b321976d3..1da5fb2fca 100644
+index 540b38a0b7..62ea393074 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -925,6 +925,8 @@ github.com/cockroachdb/cockroach-go/v2 v2.3.8 h1:53yoUo4+EtrC1NrAEgnnad4AS3ntNvG
@@ -1469,7 +1469,7 @@ index 6b321976d3..1da5fb2fca 100644
  github.com/huandu/xstrings v1.3.3/go.mod h1:y5/lhBue+AyNmUVz9RLU9xbLR0o4KIIExikq4ovT0aE=
  github.com/huandu/xstrings v1.5.0 h1:2ag3IFq9ZDANvthTwTiqSSZLjDc+BedvHPAp5tJy2TI=
 diff --git a/helper/builtinplugins/registry_full.go b/helper/builtinplugins/registry_full.go
-index 32bba40487..b4931436e2 100644
+index ac56d139df..3e72a3a2da 100644
 --- a/helper/builtinplugins/registry_full.go
 +++ b/helper/builtinplugins/registry_full.go
 @@ -32,6 +32,7 @@ import (
@@ -1480,17 +1480,29 @@ index 32bba40487..b4931436e2 100644
  	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
  	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
  	credRadius "github.com/hashicorp/vault/builtin/credential/radius"
-@@ -64,6 +65,7 @@ func newFullAddonRegistry() *registry {
- 			"cf":         {Factory: credCF.Factory},
- 			"gcp":        {Factory: credGcp.Factory},
- 			"github":     {Factory: credGitHub.Factory},
-+			"gitlab":     {Factory: credGitlab.Factory},
- 			"kerberos":   {Factory: credKerb.Factory},
- 			"kubernetes": {Factory: credKube.Factory},
- 			"ldap":       {Factory: credLdap.Factory},
+@@ -70,6 +71,7 @@ func newFullAddonRegistry() *registry {
+ 			pluginconsts.AuthTypeLDAP:       {Factory: credLdap.Factory},
+ 			pluginconsts.AuthTypeOCI:        {Factory: credOCI.Factory},
+ 			pluginconsts.AuthTypeOkta:       {Factory: credOkta.Factory},
++			pluginconsts.AuthTypeGitlab:     {Factory: credGitlab.Factory},
+ 			pluginconsts.AuthTypePCF: {
+ 				Factory:           credCF.Factory,
+ 				DeprecationStatus: consts.Deprecated,
+diff --git a/helper/pluginconsts/plugin_consts.go b/helper/pluginconsts/plugin_consts.go
+index 37d1f2b966..71410157b5 100644
+--- a/helper/pluginconsts/plugin_consts.go
++++ b/helper/pluginconsts/plugin_consts.go
+@@ -19,6 +19,7 @@ const (
+ 	AuthTypeOkta       = "okta"
+ 	AuthTypePCF        = "pcf"
+ 	AuthTypeRadius     = "radius"
++	AuthTypeGitlab     = "gitlab"
+ 	AuthTypeToken      = "token"
+ 	AuthTypeCert       = "cert"
+ 	AuthTypeOIDC       = "oidc"
 diff --git a/patch b/patch
 new file mode 100644
-index 0000000000..8e7464c0a0
+index 0000000000..58bc018e71
 --- /dev/null
 +++ b/patch
 @@ -0,0 +1,244 @@
@@ -1499,61 +1511,61 @@ index 0000000000..8e7464c0a0
 +--- a/command/base_predict.go
 ++++ b/command/base_predict.go
 +@@ -111,6 +111,7 @@ func (b *BaseCommand) PredictVaultAvailableAuths() complete.Predictor {
-+ 		"cert",
-+ 		"gcp",
-+ 		"github",
++		"cert",
++		"gcp",
++		"github",
 ++		"gitlab",
-+ 		"ldap",
-+ 		"okta",
-+ 		"plugin",
++		"ldap",
++		"okta",
++		"plugin",
 +diff --git a/command/base_predict_test.go b/command/base_predict_test.go
 +index 387b8f0b84..477eda9c5f 100644
 +--- a/command/base_predict_test.go
 ++++ b/command/base_predict_test.go
 +@@ -359,6 +359,7 @@ func TestPredict_Plugins(t *testing.T) {
-+ 				"gcp",
-+ 				"gcpkms",
-+ 				"github",
++				"gcp",
++				"gcpkms",
++				"github",
 ++				"gitlab",
-+ 				"hana-database-plugin",
-+ 				"influxdb-database-plugin",
-+ 				"jwt",
++				"hana-database-plugin",
++				"influxdb-database-plugin",
++				"jwt",
 +diff --git a/command/commands_full.go b/command/commands_full.go
 +index 8db22350cf..18bb2845b9 100644
 +--- a/command/commands_full.go
 ++++ b/command/commands_full.go
 +@@ -15,6 +15,7 @@ import (
-+ 	credOCI "github.com/hashicorp/vault-plugin-auth-oci"
-+ 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
-+ 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
++	credOCI "github.com/hashicorp/vault-plugin-auth-oci"
++	credAws "github.com/hashicorp/vault/builtin/credential/aws"
++	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
 ++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
-+ 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
-+ 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
-+ 	credUserpass "github.com/hashicorp/vault/builtin/credential/userpass"
++	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
++	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
++	credUserpass "github.com/hashicorp/vault/builtin/credential/userpass"
 +@@ -75,6 +76,7 @@ func newFullAddonHandlers() (map[string]physical.Factory, map[string]LoginHandle
-+ 		"cf":       &credCF.CLIHandler{},
-+ 		"gcp":      &credGcp.CLIHandler{},
-+ 		"github":   &credGitHub.CLIHandler{},
++		"cf":       &credCF.CLIHandler{},
++		"gcp":      &credGcp.CLIHandler{},
++		"github":   &credGitHub.CLIHandler{},
 ++		"gitlab":   &credGitlab.CLIHandler{},
-+ 		"kerberos": &credKerb.CLIHandler{},
-+ 		"ldap":     &credLdap.CLIHandler{},
-+ 		"oci":      &credOCI.CLIHandler{},
++		"kerberos": &credKerb.CLIHandler{},
++		"ldap":     &credLdap.CLIHandler{},
++		"oci":      &credOCI.CLIHandler{},
 +diff --git a/go.mod b/go.mod
 +index 3e3bd5e62f..f6e4d98ed6 100644
 +--- a/go.mod
 ++++ b/go.mod
 +@@ -231,9 +231,11 @@ require (
 + require (
-+ 	cel.dev/expr v0.15.0 // indirect
-+ 	cloud.google.com/go/longrunning v0.6.0 // indirect
++	cel.dev/expr v0.15.0 // indirect
++	cloud.google.com/go/longrunning v0.6.0 // indirect
 ++	github.com/coder/websocket v1.8.12 // indirect
-+ 	github.com/containerd/containerd v1.7.20 // indirect
-+ 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
-+ 	github.com/hashicorp/go-secure-stdlib/httputil v0.1.0 // indirect
++	github.com/containerd/containerd v1.7.20 // indirect
++	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
++	github.com/hashicorp/go-secure-stdlib/httputil v0.1.0 // indirect
 ++	github.com/hasura/go-graphql-client v0.13.1 // indirect
-+ 	github.com/mitchellh/go-testing-interface v1.14.1 // indirect
-+ 	github.com/moby/docker-image-spec v1.3.1 // indirect
-+ 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
++	github.com/mitchellh/go-testing-interface v1.14.1 // indirect
++	github.com/moby/docker-image-spec v1.3.1 // indirect
++	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 +diff --git a/go.sum b/go.sum
 +index 6b321976d3..1da5fb2fca 100644
 +--- a/go.sum
@@ -1581,21 +1593,21 @@ index 0000000000..8e7464c0a0
 +--- a/helper/builtinplugins/registry_full.go
 ++++ b/helper/builtinplugins/registry_full.go
 +@@ -32,6 +32,7 @@ import (
-+ 	logicalTerraform "github.com/hashicorp/vault-plugin-secrets-terraform"
-+ 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
-+ 	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
++	logicalTerraform "github.com/hashicorp/vault-plugin-secrets-terraform"
++	credAws "github.com/hashicorp/vault/builtin/credential/aws"
++	credGitHub "github.com/hashicorp/vault/builtin/credential/github"
 ++	credGitlab "github.com/hashicorp/vault/builtin/credential/gitlab"
-+ 	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
-+ 	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
-+ 	credRadius "github.com/hashicorp/vault/builtin/credential/radius"
++	credLdap "github.com/hashicorp/vault/builtin/credential/ldap"
++	credOkta "github.com/hashicorp/vault/builtin/credential/okta"
++	credRadius "github.com/hashicorp/vault/builtin/credential/radius"
 +@@ -64,6 +65,7 @@ func newFullAddonRegistry() *registry {
-+ 			"cf":         {Factory: credCF.Factory},
-+ 			"gcp":        {Factory: credGcp.Factory},
-+ 			"github":     {Factory: credGitHub.Factory},
++			"cf":         {Factory: credCF.Factory},
++			"gcp":        {Factory: credGcp.Factory},
++			"github":     {Factory: credGitHub.Factory},
 ++			"gitlab":     {Factory: credGitlab.Factory},
-+ 			"kerberos":   {Factory: credKerb.Factory},
-+ 			"kubernetes": {Factory: credKube.Factory},
-+ 			"ldap":       {Factory: credLdap.Factory},
++			"kerberos":   {Factory: credKerb.Factory},
++			"kubernetes": {Factory: credKube.Factory},
++			"ldap":       {Factory: credLdap.Factory},
 +diff --git a/ui/app/adapters/cluster.js b/ui/app/adapters/cluster.js
 +index 5a8984ec33..dcc709f242 100644
 +--- a/ui/app/adapters/cluster.js
