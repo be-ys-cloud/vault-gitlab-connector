@@ -53,20 +53,29 @@ practices, please refer to
 * First of all, you will need to create a GitLab token that can impersonate users. We need it in order to transform
   our `CI_JOB_TOKEN` into user rights. As `CI_JOB_TOKEN` could not access directly to the GitLab APIs we are interested
   in, we have to create an impersonation token, that is immediately removed when authentication succeed.
-    * Log-in to GitLab with a user that is able to impersonate (we suggest to use `root` or another "service account",
-      as this account is not a personal account and thus will never be disabled) ;
-    * Go to https://<your_gitlab_instance>/-/profile/personal_access_tokens, and generate a Personal Access Token with (
-      at least) the following rights:
+    * Log-in to GitLab with a user that is able to impersonate:
+        * It can be a personal access token (we suggest to use the `root` admin, as this account is not a personal
+          account and thus will never be disabled) ;
+        * It can also be an instance service account (which can be managed by any instance admin), but make sure you
+          give this service account the administrator role (the same way you would give admin privileges to a normal
+          user).
+    * Go to `https://<your_gitlab_instance>/-/profile/personal_access_tokens` for a user account
+      or to `https://<your_gitlab_instance>/admin/application_settings/service_accounts` for a service account,
+      and generate an Access Token with (at least) the following rights:
         * `api`
         * `read_api`
         * `read_user`
         * `sudo`
+        * `admin_mode`
     * **Caution: Starting Gitlab 16.0, Personal Access Token must have an expiration date. Please, be aware of the
       expiration date of the token, and do the appropriate action to generate a new one before it expires.**
+      If needed, you can overwrite the expiration date of an access token using the `gitlab-rails console`:
+        * Find your access token with `PersonalAccessToken.where({revoked: false})`.
+        * Update the expiration date with `PersonalAccessToken.where({id: xxx}).update_all({expires_at: Date.parse('2030-01-01')})`.
     * Keep the generated PAT in a safe place, we'll use it later in Vault configuration
 * Then, we have to create an OAuth2 application that will enable the possibility for users to log-in seamlessly to Vault
   using GitLab callbacks.
-    * Go to https://<your_gitlab_instance>/admin/applications, and create a new one
+    * Go to `https://<your_gitlab_instance>/admin/applications`, and create a new one
         * Name: what you want
             * eg: Vault
         * Redirect URI: The URI of your (yet to configure) Vault Server, with `/v1/auth/gitlab/oauth` as final path
@@ -75,6 +84,7 @@ practices, please refer to
           GitLab to confirm that user wants to connect to GitLab.
         * Set the "confidential" parameter to "true"
         * Scopes: you must, at least, give the following scopes to the application:
+            * `api`
             * `read_api`
             * `read_user`
             * `openid`
